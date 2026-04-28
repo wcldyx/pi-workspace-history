@@ -1,0 +1,45 @@
+{
+  "name": "workspace-history",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Workspace history extension for @mariozechner/pi-coding-agent",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-plugin",
+    "pi-extension",
+    "workspace-history",
+    "undo",
+    "redo",
+    "tree-navigation"
+  ],
+  "license": "MIT",
+  "files": [
+    ".pi/extensions/workspace-history.ts",
+    "README.md",
+    "README.zh-CN.md",
+    "CHANGELOG.md"
+  ],
+  "pi": {
+    "extensions": [
+      ".pi/extensions/workspace-history.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx tests/workspace-history.test.ts"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.70.5"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-ai": "0.70.5",
+    "@mariozechner/pi-coding-agent": "0.70.5",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
