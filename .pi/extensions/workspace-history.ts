@@ -649,7 +649,6 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
     const sessionId = ctx.sessionManager.getSessionId();
     await ensureShadowRepo(pi, ctx.cwd, sessionId);
-    await ensureBaselineSnapshot(pi, ctx);
   });
 
   pi.on("before_agent_start", async (event, ctx) => {

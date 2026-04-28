@@ -230,6 +230,29 @@ async function testUndoRedo(): Promise<void> {
   }
 }
 
+async function testSessionStartDoesNotCreateBaselineEagerly(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+
+    assert.equal(countSnapshots(session), 0, "session start should not create baseline eagerly");
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "lazy.txt", content: "lazy baseline\n" })]),
+      fauxAssistantMessage("created lazy file"),
+    ]);
+
+    await session.prompt("create lazy.txt");
+    await waitFor(() => countSnapshots(session, "after") >= 1, "after snapshot was not created for lazy baseline flow");
+
+    assert.equal(countSnapshots(session, "baseline") >= 1, true, "baseline should be created lazily before the first turn");
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
 async function testManualChangesProtectedAcrossUndo(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -557,6 +580,7 @@ async function testRestoreFailureDoesNotDeleteCurrentWorkspace(): Promise<void> 
 
 async function main(): Promise<void> {
   const tests: Array<{ name: string; run: () => Promise<void> }> = [
+    { name: "session start does not create baseline eagerly", run: testSessionStartDoesNotCreateBaselineEagerly },
     { name: "undo/redo restores workspace", run: testUndoRedo },
     { name: "undo preserves manual changes before next turn", run: testManualChangesProtectedAcrossUndo },
     { name: "repeated undo walks back turn by turn", run: testRepeatedUndo },
