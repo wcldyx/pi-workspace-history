@@ -111,7 +111,7 @@
 如果作为插件包安装：
 
 ```bash
-pi install npm:workspace-history
+pi install npm:pi-workspace-history
 ```
 
 当这个包发布到 npm 后，用户就可以直接用上面的命令安装。

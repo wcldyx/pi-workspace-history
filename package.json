@@ -1,8 +1,9 @@
 {
-  "name": "workspace-history",
+  "name": "pi-workspace-history",
   "version": "0.1.0",
   "type": "module",
   "description": "Workspace history extension for @mariozechner/pi-coding-agent",
+  "author": "wcldyx",
   "keywords": [
     "pi-package",
     "pi",
@@ -14,6 +15,14 @@
     "tree-navigation"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wcldyx/pi-workspace-history.git"
+  },
+  "homepage": "https://github.com/wcldyx/pi-workspace-history#readme",
+  "bugs": {
+    "url": "https://github.com/wcldyx/pi-workspace-history/issues"
+  },
   "files": [
     ".pi/extensions/workspace-history.ts",
     "README.md",

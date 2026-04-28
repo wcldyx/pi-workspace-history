@@ -112,7 +112,7 @@ During restore, the plugin restores only the managed file set instead of doing a
 Install from a package source:
 
 ```bash
-pi install npm:workspace-history
+pi install npm:pi-workspace-history
 ```
 
 After publishing this package to npm, users can install it directly with the command above.
