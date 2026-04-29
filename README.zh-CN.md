@@ -106,6 +106,37 @@
 
 恢复时，插件只恢复它纳管的文件集合，不会粗暴地对整个工作区做无差别清理。
 
+## 配置
+
+通过 Pi 的 settings 配置：
+
+- 全局：`~/.pi/agent/settings.json`
+- 项目：`.pi/settings.json`
+
+示例：
+
+```json
+{
+  "workspaceHistory": {
+    "storageDir": "D:\\pi-history",
+    "maxSessionsPerWorkspace": 3,
+    "maxWorkspaces": 10
+  }
+}
+```
+
+配置项：
+
+- `workspaceHistory.storageDir`
+  - shadow history 的外部存储根目录
+  - 默认：`~/.pi/agent/state/workspace-history`
+- `workspaceHistory.maxSessionsPerWorkspace`
+  - 每个工作区最多保留最近使用的 session 数
+  - 默认：`3`
+- `workspaceHistory.maxWorkspaces`
+  - 全局最多保留最近使用的工作区数
+  - 默认：`10`
+
 ## 安装与使用
 
 如果作为插件包安装：
@@ -152,18 +183,33 @@ npm test
 npm run typecheck
 ```
 
+## 最近更新
+
+- 历史默认存到工作区外
+- 增加 `workspaceHistory.storageDir`
+- 增加 session / workspace 保留策略
+- 通过缓存设置/路径和节流 cleanup 降低运行时开销
+
 ## 存储目录
 
-插件会在工作区下创建内部状态目录：
+插件默认把历史存到工作区外：
 
 ```text
-.pi/workspace-history/
-  sessions/
-    <sessionId>/
-      repo.git/
-      redo.json
+~/.pi/agent/state/workspace-history/
+  workspaces/
+    <workspaceHash>/
+      meta.json
+      sessions/
+        <sessionId>/
+          repo.git/
+          redo.json
+          meta.json
   logs/
     timemachine.log
 ```
 
-这个 shadow git 与用户项目自身的 `.git` 历史隔离。
+说明：
+
+- shadow git 与用户项目自身的 `.git` 历史隔离
+- 旧的工作区内 `.pi/workspace-history/` 状态不会自动迁移
+- 清理策略基于最近使用时间（LRU 风格）

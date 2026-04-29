@@ -107,6 +107,37 @@ Default exclusions:
 
 During restore, the plugin restores only the managed file set instead of doing a broad destructive cleanup of the entire workspace.
 
+## Configuration
+
+Configure via Pi settings:
+
+- Global: `~/.pi/agent/settings.json`
+- Project: `.pi/settings.json`
+
+Example:
+
+```json
+{
+  "workspaceHistory": {
+    "storageDir": "D:\\pi-history",
+    "maxSessionsPerWorkspace": 3,
+    "maxWorkspaces": 10
+  }
+}
+```
+
+Settings:
+
+- `workspaceHistory.storageDir`
+  - External storage root for shadow history
+  - Default: `~/.pi/agent/state/workspace-history`
+- `workspaceHistory.maxSessionsPerWorkspace`
+  - Keep only the most recently used sessions per workspace
+  - Default: `3`
+- `workspaceHistory.maxWorkspaces`
+  - Keep only the most recently used workspaces globally
+  - Default: `10`
+
 ## Installation And Usage
 
 Install from a package source:
@@ -153,18 +184,33 @@ Run type checking:
 npm run typecheck
 ```
 
+## Recent Changes
+
+- History is stored outside the workspace by default
+- Added `workspaceHistory.storageDir`
+- Added retention limits for sessions and workspaces
+- Reduced runtime overhead with cached settings/paths and throttled cleanup
+
 ## Storage Layout
 
-The plugin creates an internal state directory inside the workspace:
+The plugin stores history outside the workspace by default:
 
 ```text
-.pi/workspace-history/
-  sessions/
-    <sessionId>/
-      repo.git/
-      redo.json
+~/.pi/agent/state/workspace-history/
+  workspaces/
+    <workspaceHash>/
+      meta.json
+      sessions/
+        <sessionId>/
+          repo.git/
+          redo.json
+          meta.json
   logs/
     timemachine.log
 ```
 
-This shadow git history is isolated from the user's project `.git` history.
+Notes:
+
+- History is isolated from the user's project `.git` history
+- Old workspace-local `.pi/workspace-history/` state is not migrated automatically
+- Cleanup is LRU-style based on recent use

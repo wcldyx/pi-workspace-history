@@ -1,7 +1,8 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   AuthStorage,
   createAgentSession,
@@ -161,6 +162,15 @@ async function createSession(ctx: TestContext) {
 async function exists(filePath: string): Promise<boolean> {
   try {
     await readFile(filePath, "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath);
     return true;
   } catch {
     return false;
@@ -498,6 +508,32 @@ async function testPiFilesAreSnapshotManagedExceptInternalState(): Promise<void>
   }
 }
 
+async function testHistoryIsStoredOutsideWorkspace(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "outside.txt", content: "outside\n" })]),
+      fauxAssistantMessage("created outside file"),
+    ]);
+
+    await session.prompt("create outside.txt");
+    await waitFor(() => countSnapshots(session, "after") >= 1, "outside storage after snapshot was not created");
+
+    const legacyDir = path.join(ctx.cwd, ".pi", "workspace-history");
+    assert.equal(await pathExists(legacyDir), false, "legacy workspace history dir should not be created in workspace");
+
+    const externalRoot = path.join(getAgentDir(), "state", "workspace-history");
+    const workspacesDir = path.join(externalRoot, "workspaces");
+    assert.equal(await pathExists(workspacesDir), true, "external workspace history dir should exist");
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
 async function testUndoAndRedoBlockOnUnsnapshottedManualChanges(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -557,7 +593,8 @@ async function testRestoreFailureDoesNotDeleteCurrentWorkspace(): Promise<void> 
     await waitFor(() => countSnapshots(session, "after") >= 1, "safe file after snapshot was not created");
 
     const sessionId = session.sessionManager.getSessionId();
-    const gitDir = path.join(ctx.cwd, ".pi", "workspace-history", "sessions", sessionId, "repo.git");
+    const workspaceHash = createHash("sha256").update(ctx.cwd).digest("hex").slice(0, 24);
+    const gitDir = path.join(getAgentDir(), "state", "workspace-history", "workspaces", workspaceHash, "sessions", sessionId, "repo.git");
     await rm(gitDir, { recursive: true, force: true });
 
     const baseline = session.sessionManager
@@ -588,6 +625,7 @@ async function main(): Promise<void> {
     { name: "tree switching restores branch-specific workspace", run: testTreeBranchSwitching },
     { name: "undo does not leak across sessions", run: testUndoDoesNotLeakAcrossSessions },
     { name: ".pi files are managed except internal state", run: testPiFilesAreSnapshotManagedExceptInternalState },
+    { name: "history is stored outside workspace", run: testHistoryIsStoredOutsideWorkspace },
     { name: "undo and redo block on unsnapshotted manual changes", run: testUndoAndRedoBlockOnUnsnapshottedManualChanges },
     { name: "restore failure does not delete current workspace", run: testRestoreFailureDoesNotDeleteCurrentWorkspace },
   ];

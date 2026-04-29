@@ -1,6 +1,6 @@
 {
   "name": "pi-workspace-history",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "description": "Workspace history extension for @mariozechner/pi-coding-agent",
   "author": "wcldyx",
@@ -36,7 +36,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "tsx tests/workspace-history.test.ts"
+    "test": "tsx tests/workspace-history.test.ts",
+    "bench:first-turn": "tsx tests/benchmark-first-turn.ts"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "^0.70.5"
