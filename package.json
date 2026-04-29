@@ -1,6 +1,6 @@
 {
   "name": "pi-workspace-history",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "module",
   "description": "Workspace history extension for @mariozechner/pi-coding-agent",
   "author": "wcldyx",
@@ -52,5 +52,8 @@
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
+  },
+  "dependencies": {
+    "ignore": "^7.0.5"
   }
 }

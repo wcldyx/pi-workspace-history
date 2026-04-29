@@ -185,15 +185,29 @@ function normalizeEol(text: string): string {
   return text.replace(/\r\n/g, "\n");
 }
 
-async function waitFor(condition: () => boolean, message: string, timeoutMs = 5000): Promise<void> {
+async function waitFor(condition: () => boolean | Promise<boolean>, message: string, timeoutMs = 5000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    if (condition()) {
+    if (await condition()) {
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error(message);
+}
+
+async function waitForExists(filePath: string, expected: boolean, message: string): Promise<void> {
+  await waitFor(async () => (await exists(filePath)) === expected, message);
+}
+
+async function waitForText(filePath: string, expected: string, message: string): Promise<void> {
+  await waitFor(async () => {
+    try {
+      return normalizeEol(await readText(filePath)) === expected;
+    } catch {
+      return false;
+    }
+  }, message);
 }
 
 function countSnapshots(session: Awaited<ReturnType<typeof createSession>>, kind?: string): number {
@@ -228,11 +242,11 @@ async function testUndoRedo(): Promise<void> {
     assert.equal(normalizeEol(await readText(filePath)), "hello from turn 1\n");
 
     await session.prompt("/undo");
-    assert.equal(await exists(filePath), false, "file should be removed after /undo");
+    await waitForExists(filePath, false, "file should be removed after /undo");
 
     await session.prompt("/redo");
-    assert.equal(await exists(filePath), true, "file should be restored after /redo");
-    assert.equal(normalizeEol(await readText(filePath)), "hello from turn 1\n");
+    await waitForExists(filePath, true, "file should be restored after /redo");
+    await waitForText(filePath, "hello from turn 1\n", "hello.txt should match after /redo");
 
     session.dispose();
   } finally {
@@ -246,6 +260,8 @@ async function testSessionStartDoesNotCreateBaselineEagerly(): Promise<void> {
     const session = await createSession(ctx);
 
     assert.equal(countSnapshots(session), 0, "session start should not create baseline eagerly");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(countSnapshots(session), 0, "idle baseline warmup should not append snapshot entries before the first turn");
 
     ctx.provider.setResponses([
       fauxAssistantMessage([fauxToolCall("write", { path: "lazy.txt", content: "lazy baseline\n" })]),
@@ -299,8 +315,8 @@ async function testManualChangesProtectedAcrossUndo(): Promise<void> {
     assert.equal(await exists(fileB), true);
 
     await session.prompt("/undo");
-    assert.equal(await exists(fileB), false, "B should be removed after undoing the second turn");
-    assert.equal(await exists(fileA), false, "manually deleted A should not reappear");
+    await waitForExists(fileB, false, "B should be removed after undoing the second turn");
+    await waitForExists(fileA, false, "manually deleted A should not reappear");
 
     session.dispose();
   } finally {
@@ -382,12 +398,12 @@ async function testRepeatedUndo(): Promise<void> {
     assert.equal(await exists(fileC), true);
 
     await session.prompt("/undo");
-    assert.equal(await exists(fileA), true, "A should remain after the first undo");
-    assert.equal(await exists(fileB), false, "B should be removed after the first undo");
-    assert.equal(await exists(fileC), false, "C should be removed after the first undo");
+    await waitForExists(fileA, true, "A should remain after the first undo");
+    await waitForExists(fileB, false, "B should be removed after the first undo");
+    await waitForExists(fileC, false, "C should be removed after the first undo");
 
     await session.prompt("/undo");
-    assert.equal(await exists(fileA), false, "A should be removed after the second undo");
+    await waitForExists(fileA, false, "A should be removed after the second undo");
 
     session.dispose();
   } finally {
@@ -422,7 +438,7 @@ async function testTreeBranchSwitching(): Promise<void> {
     assert.ok(cAfter, "C after snapshot should exist");
 
     await session.prompt("/undo");
-    assert.equal(normalizeEol(await readText(fileA)), "A\n", "after undoing back before C, the file should be A");
+    await waitForText(fileA, "A\n", "after undoing back before C, the file should be A");
 
     await session.prompt("change branch.txt to D");
     await waitFor(() => countSnapshots(session, "after") >= 3, "D branch after snapshot was not created");
@@ -497,10 +513,10 @@ async function testPiFilesAreSnapshotManagedExceptInternalState(): Promise<void>
     assert.equal(normalizeEol(await readText(piFile)), "pi managed file\n");
 
     await session.prompt("/undo");
-    assert.equal(await exists(piFile), false, ".pi regular file should be removed after /undo");
+    await waitForExists(piFile, false, ".pi regular file should be removed after /undo");
 
     await session.prompt("/redo");
-    assert.equal(normalizeEol(await readText(piFile)), "pi managed file\n", ".pi regular file should be restored after /redo");
+    await waitForText(piFile, "pi managed file\n", ".pi regular file should be restored after /redo");
 
     session.dispose();
   } finally {
@@ -558,10 +574,10 @@ async function testUndoAndRedoBlockOnUnsnapshottedManualChanges(): Promise<void>
 
     await session.prompt("/checkpoint guard-manual");
     await session.prompt("/undo");
-    assert.equal(await exists(filePath), false, "file should be removed after undo once manual edits are checkpointed");
+    await waitForExists(filePath, false, "file should be removed after undo once manual edits are checkpointed");
 
     await session.prompt("/redo");
-    assert.equal(normalizeEol(await readText(filePath)), "manual edit\n", "redo should restore the last successfully undone location");
+    await waitForText(filePath, "manual edit\n", "redo should restore the last successfully undone location");
 
     await writeFile(filePath, "manual redo edit\n", "utf8");
     const redoLeafBefore = session.sessionManager.getLeafId();
@@ -571,6 +587,37 @@ async function testUndoAndRedoBlockOnUnsnapshottedManualChanges(): Promise<void>
 
     assert.equal(redoLeafAfter, redoLeafBefore, "/redo should be blocked by unsnapshotted manual edits");
     assert.equal(normalizeEol(await readText(filePath)), "manual redo edit\n", "manual edits should remain after blocked /redo");
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testGitignoreStopsManagingIgnoredPaths(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    const ignoredFilePath = path.join(ctx.cwd, "generated.txt");
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "generated.txt", content: "turn one\n" })]),
+      fauxAssistantMessage("created generated file"),
+      fauxAssistantMessage([fauxToolCall("write", { path: ".gitignore", content: "generated.txt\n" })]),
+      fauxAssistantMessage("ignored generated file"),
+    ]);
+
+    await session.prompt("create generated.txt");
+    await waitFor(() => countSnapshots(session, "after") >= 1, "generated file after snapshot was not created");
+
+    await session.prompt("ignore generated.txt in .gitignore");
+    await waitFor(() => countSnapshots(session, "after") >= 2, ".gitignore update after snapshot was not created");
+
+    await writeFile(ignoredFilePath, "manual ignored edit\n", "utf8");
+    await session.prompt("/undo");
+
+    await waitForText(ignoredFilePath, "manual ignored edit\n", "ignored file should no longer be managed after .gitignore excludes it");
+    await waitForExists(path.join(ctx.cwd, ".gitignore"), false, ".gitignore should be removed when undoing to the earlier snapshot");
 
     session.dispose();
   } finally {
@@ -627,6 +674,7 @@ async function main(): Promise<void> {
     { name: ".pi files are managed except internal state", run: testPiFilesAreSnapshotManagedExceptInternalState },
     { name: "history is stored outside workspace", run: testHistoryIsStoredOutsideWorkspace },
     { name: "undo and redo block on unsnapshotted manual changes", run: testUndoAndRedoBlockOnUnsnapshottedManualChanges },
+    { name: ".gitignore stops managing ignored paths", run: testGitignoreStopsManagingIgnoredPaths },
     { name: "restore failure does not delete current workspace", run: testRestoreFailureDoesNotDeleteCurrentWorkspace },
   ];
 

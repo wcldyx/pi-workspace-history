@@ -19,6 +19,7 @@ import {
   readdir,
 } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
+import ignore, { type Ignore } from "ignore";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -62,6 +63,11 @@ interface RuntimeState {
   cleanupPromise?: Promise<void>;
   lastCleanupAt?: number;
   initialSnapshotCommit?: string;
+  warmedBaselineCommit?: string;
+  baselineWarmupPromise?: Promise<void>;
+  baselineWarmupGeneration?: number;
+  cachedGitignoreSource?: string;
+  cachedSnapshotIgnoreMatcher?: Ignore;
 }
 
 interface NavigationPrecheckResult {
@@ -337,28 +343,39 @@ async function cleanupWorkspaceHistory(ctx: ExtensionContext, state?: RuntimeSta
   }
 }
 
-function shouldExcludeSnapshotPath(relativePath: string): boolean {
-  const normalized = relativePath.replace(/\\/g, "/");
-  const segments = normalized.split("/").filter((segment) => segment.length > 0);
-  const baseName = segments[segments.length - 1] ?? "";
+function normalizeSnapshotPath(relativePath: string): string {
+  return relativePath.replace(/\\/g, "/").replace(/^\.\//, "");
+}
 
-  if (segments.some((segment) => segment === ".git" || segment === "node_modules")) {
-    return true;
+async function getSnapshotIgnoreMatcher(ctx: ExtensionContext, state?: RuntimeState): Promise<Ignore> {
+  const gitignorePath = path.join(ctx.cwd, ".gitignore");
+  const gitignoreSource = await readFile(gitignorePath, "utf8").catch(() => "");
+
+  if (state?.cachedSnapshotIgnoreMatcher && state.cachedGitignoreSource === gitignoreSource) {
+    return state.cachedSnapshotIgnoreMatcher;
   }
 
-  if (normalized === ".pi/workspace-history" || normalized.startsWith(".pi/workspace-history/")) {
-    return true;
+  const matcher = ignore();
+  matcher.add(DEFAULT_EXCLUDES);
+  if (gitignoreSource.trim().length > 0) {
+    matcher.add(gitignoreSource);
   }
 
-  if (segments.some((segment) => segment === "dist" || segment === "build" || segment === ".cache" || segment === ".next" || segment === ".turbo" || segment === "coverage")) {
-    return true;
+  if (state) {
+    state.cachedGitignoreSource = gitignoreSource;
+    state.cachedSnapshotIgnoreMatcher = matcher;
   }
 
-  if (baseName === ".env" || baseName.startsWith(".env.")) {
-    return true;
-  }
+  return matcher;
+}
 
-  return false;
+async function filterSnapshotPaths(
+  ctx: ExtensionContext,
+  relativePaths: string[],
+  state?: RuntimeState,
+): Promise<string[]> {
+  const matcher = await getSnapshotIgnoreMatcher(ctx, state);
+  return relativePaths.filter((relativePath) => !matcher.ignores(normalizeSnapshotPath(relativePath)));
 }
 
 function parseNullSeparatedPaths(raw: string): string[] {
@@ -436,7 +453,7 @@ async function listUntrackedPaths(pi: ExtensionAPI, ctx: ExtensionContext, state
 async function stageSnapshotFiles(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
   const trackedPaths = await listTrackedPaths(pi, ctx, state);
   const untrackedPaths = await listUntrackedPaths(pi, ctx, state);
-  const candidates = [...new Set([...trackedPaths, ...untrackedPaths])].filter((relativePath) => !shouldExcludeSnapshotPath(relativePath));
+  const candidates = await filterSnapshotPaths(ctx, [...new Set([...trackedPaths, ...untrackedPaths])], state);
 
   if (candidates.length === 0) {
     return;
@@ -521,12 +538,8 @@ async function restoreSnapshotCommit(pi: ExtensionAPI, ctx: ExtensionContext, co
 
   const currentTracked = await listTrackedPaths(pi, ctx, state);
   const currentUntracked = await listUntrackedPaths(pi, ctx, state);
-  const currentManaged = [...new Set([...currentTracked, ...currentUntracked])].filter(
-    (relativePath) => !shouldExcludeSnapshotPath(relativePath),
-  );
-  const targetManaged = (await listSnapshotPathsAtCommit(pi, ctx, commit)).filter(
-    (relativePath) => !shouldExcludeSnapshotPath(relativePath),
-  );
+  const currentManaged = await filterSnapshotPaths(ctx, [...new Set([...currentTracked, ...currentUntracked])], state);
+  const targetManaged = await filterSnapshotPaths(ctx, await listSnapshotPathsAtCommit(pi, ctx, commit), state);
 
   const targetSet = new Set(targetManaged);
   const pathsToRemove = currentManaged.filter((relativePath) => !targetSet.has(relativePath));
@@ -769,21 +782,17 @@ async function ensureBaselineSnapshot(
   await logLine(ctx, `create baseline snapshot entry=${snapshotId} commit=${commit} leaf=${snapshotId}`, state);
 }
 
-async function isWorkspaceDirtyAgainstSnapshot(
+async function isWorkspaceDirtyAgainstCommit(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
-  snapshot: CustomEntry<WorkspaceSnapshot> | undefined,
+  commit: string,
   state?: RuntimeState,
 ): Promise<boolean> {
-  if (!hasSnapshotData(snapshot)) {
-    return false;
-  }
-
   await ensureShadowRepo(pi, ctx, state);
 
   const diffResult = await pi.exec(
     "git",
-    await gitArgs(ctx, state, "diff", "--name-only", snapshot.data.commit, "--", "."),
+    await gitArgs(ctx, state, "diff", "--name-only", commit, "--", "."),
     { cwd: ctx.cwd },
   );
 
@@ -791,16 +800,8 @@ async function isWorkspaceDirtyAgainstSnapshot(
     throw new Error(diffResult.stderr || diffResult.stdout || "git diff failed");
   }
 
-  const dirtyDiffPaths = parseLineSeparatedPaths(diffResult.stdout).filter(
-    (relativePath) => !shouldExcludeSnapshotPath(relativePath),
-  );
-
+  const dirtyDiffPaths = await filterSnapshotPaths(ctx, parseLineSeparatedPaths(diffResult.stdout), state);
   if (dirtyDiffPaths.length > 0) {
-    await logLine(
-      ctx,
-      `dirty-check dirty reason=diff leaf=${ctx.sessionManager.getLeafId()} snapshot=${snapshot.id} paths=${dirtyDiffPaths.join("|")}`,
-      state,
-    );
     return true;
   }
 
@@ -814,19 +815,20 @@ async function isWorkspaceDirtyAgainstSnapshot(
     throw new Error(untrackedResult.stderr || untrackedResult.stdout || "git ls-files failed");
   }
 
-  const untrackedPaths = parseNullSeparatedPaths(untrackedResult.stdout).filter(
-    (relativePath) => !shouldExcludeSnapshotPath(relativePath),
-  );
-
-  if (untrackedPaths.length > 0) {
-    await logLine(
-      ctx,
-      `dirty-check dirty reason=untracked leaf=${ctx.sessionManager.getLeafId()} snapshot=${snapshot.id} paths=${untrackedPaths.join("|")}`,
-      state,
-    );
-  }
-
+  const untrackedPaths = await filterSnapshotPaths(ctx, parseNullSeparatedPaths(untrackedResult.stdout), state);
   return untrackedPaths.length > 0;
+}
+
+async function isWorkspaceDirtyAgainstSnapshot(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  snapshot: CustomEntry<WorkspaceSnapshot> | undefined,
+  state?: RuntimeState,
+): Promise<boolean> {
+  if (!hasSnapshotData(snapshot)) {
+    return false;
+  }
+  return isWorkspaceDirtyAgainstCommit(pi, ctx, snapshot.data.commit, state);
 }
 
 async function restoreResolvedSnapshot(
@@ -905,6 +907,41 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     return state;
   }
 
+  function scheduleBaselineWarmup(ctx: ExtensionContext, state: RuntimeState): void {
+    if (state.baselineWarmupPromise || state.warmedBaselineCommit || getSnapshotEntries(ctx).length > 0) {
+      return;
+    }
+
+    const generation = (state.baselineWarmupGeneration ?? 0) + 1;
+    state.baselineWarmupGeneration = generation;
+    state.baselineWarmupPromise = new Promise((resolve) => {
+      setTimeout(() => {
+        void (async () => {
+          try {
+            if (state.baselineWarmupGeneration !== generation || getSnapshotEntries(ctx).length > 0) {
+              return;
+            }
+
+            const commit = await createSnapshotCommit(pi, ctx, "baseline warmup", state);
+            if (state.baselineWarmupGeneration !== generation || getSnapshotEntries(ctx).length > 0) {
+              return;
+            }
+
+            state.warmedBaselineCommit = commit;
+            await logLine(ctx, `warm baseline commit=${commit}`, state);
+          } catch (error) {
+            await logLine(ctx, `warm baseline failed error=${String(error)}`, state).catch(() => undefined);
+          } finally {
+            if (state.baselineWarmupGeneration === generation) {
+              state.baselineWarmupPromise = undefined;
+            }
+            resolve();
+          }
+        })();
+      }, 0);
+    });
+  }
+
   pi.on("session_start", async (_event, ctx) => {
     const state = getState(ctx);
     state.pendingTurnId = undefined;
@@ -912,12 +949,16 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.pendingPromptText = undefined;
     state.internalNavigation = undefined;
     state.initialSnapshotCommit = undefined;
+    state.warmedBaselineCommit = undefined;
+    state.baselineWarmupPromise = undefined;
+    state.baselineWarmupGeneration = undefined;
 
     await getWorkspaceHistorySettings(ctx, state);
     await getWorkspaceStoragePaths(ctx, state);
     await touchWorkspaceAndSessionMeta(ctx, state);
     scheduleCleanup(ctx, state);
     await ensureShadowRepo(pi, ctx, state);
+    scheduleBaselineWarmup(ctx, state);
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
@@ -936,11 +977,24 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
     const turnId = randomUUID();
     const isFirstSnapshot = getSnapshotEntries(ctx).length === 0;
-    const commit = await createSnapshotCommit(pi, ctx, `before ${turnId}`, state);
+    let commit: string;
 
     if (isFirstSnapshot) {
+      const warmedCommit = state.warmedBaselineCommit;
+      if (warmedCommit && !await isWorkspaceDirtyAgainstCommit(pi, ctx, warmedCommit, state)) {
+        commit = warmedCommit;
+      } else {
+        if (warmedCommit) {
+          await logLine(ctx, `discard warm baseline commit=${warmedCommit} reason=workspace-changed`, state);
+        }
+        commit = await createSnapshotCommit(pi, ctx, `before ${turnId}`, state);
+      }
       state.initialSnapshotCommit = commit;
+      state.warmedBaselineCommit = undefined;
+      state.baselineWarmupGeneration = undefined;
       await ensureBaselineSnapshot(pi, ctx, state, commit);
+    } else {
+      commit = await createSnapshotCommit(pi, ctx, `before ${turnId}`, state);
     }
 
     pi.appendEntry<WorkspaceSnapshot>(SNAPSHOT_TYPE, {

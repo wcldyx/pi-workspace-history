@@ -89,6 +89,7 @@
 
 - Git tracked 文件
 - 未被 ignore 的 untracked 文件
+- 命中工作区 `.gitignore` 的路径会被过滤掉，即使它们此前已经进入过快照范围
 
 默认排除：
 

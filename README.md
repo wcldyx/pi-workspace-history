@@ -90,6 +90,7 @@ Default snapshot scope:
 
 - Git tracked files
 - Untracked files that are not ignored
+- Paths matched by the workspace `.gitignore` are filtered out even if they were previously snapshotted
 
 Default exclusions:
 
