@@ -684,6 +684,10 @@ function findSnapshotById(ctx: ExtensionContext, snapshotId: string | undefined)
   return isSnapshotEntry(entry) ? entry : undefined;
 }
 
+function getSnapshotCommit(entry: CustomEntry<WorkspaceSnapshot> | undefined): string | undefined {
+  return hasSnapshotData(entry) ? entry.data.commit : undefined;
+}
+
 function findLastAfterSnapshot(ctx: ExtensionContext): CustomEntry<WorkspaceSnapshot> | undefined {
   const branch = ctx.sessionManager.getBranch();
   for (let i = branch.length - 1; i >= 0; i -= 1) {
@@ -942,33 +946,11 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     });
   }
 
-  pi.on("session_start", async (_event, ctx) => {
-    const state = getState(ctx);
-    state.pendingTurnId = undefined;
-    state.pendingBeforeSnapshotId = undefined;
-    state.pendingPromptText = undefined;
-    state.internalNavigation = undefined;
-    state.initialSnapshotCommit = undefined;
-    state.warmedBaselineCommit = undefined;
-    state.baselineWarmupPromise = undefined;
-    state.baselineWarmupGeneration = undefined;
-
-    await getWorkspaceHistorySettings(ctx, state);
-    await getWorkspaceStoragePaths(ctx, state);
-    await touchWorkspaceAndSessionMeta(ctx, state);
-    scheduleCleanup(ctx, state);
-    await ensureShadowRepo(pi, ctx, state);
-    scheduleBaselineWarmup(ctx, state);
-  });
-
-  pi.on("before_agent_start", async (event, ctx) => {
-    const state = getState(ctx);
-    state.pendingPromptText = event.prompt;
-    await ensureShadowRepo(pi, ctx, state);
-  });
-
-  pi.on("turn_start", async (_event, ctx) => {
-    const state = getState(ctx);
+  async function ensureBeforeSnapshotForTurn(
+    ctx: ExtensionContext,
+    state: RuntimeState,
+    promptText?: string,
+  ): Promise<void> {
     if (state.pendingTurnId || state.pendingBeforeSnapshotId) {
       return;
     }
@@ -1002,7 +984,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       kind: "before",
       commit,
       turnId,
-      promptText: state.pendingPromptText,
+      promptText,
       createdAt: new Date().toISOString(),
     });
 
@@ -1014,6 +996,37 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       `create before snapshot turn=${turnId} entry=${state.pendingBeforeSnapshotId} commit=${commit} leaf=${ctx.sessionManager.getLeafId()}`,
       state,
     );
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    const state = getState(ctx);
+    state.pendingTurnId = undefined;
+    state.pendingBeforeSnapshotId = undefined;
+    state.pendingPromptText = undefined;
+    state.internalNavigation = undefined;
+    state.initialSnapshotCommit = undefined;
+    state.warmedBaselineCommit = undefined;
+    state.baselineWarmupPromise = undefined;
+    state.baselineWarmupGeneration = undefined;
+
+    await getWorkspaceHistorySettings(ctx, state);
+    await getWorkspaceStoragePaths(ctx, state);
+    await touchWorkspaceAndSessionMeta(ctx, state);
+    scheduleCleanup(ctx, state);
+    await ensureShadowRepo(pi, ctx, state);
+    scheduleBaselineWarmup(ctx, state);
+  });
+
+  pi.on("before_agent_start", async (event, ctx) => {
+    const state = getState(ctx);
+    state.pendingPromptText = event.prompt;
+    await ensureShadowRepo(pi, ctx, state);
+    await ensureBeforeSnapshotForTurn(ctx, state, event.prompt);
+  });
+
+  pi.on("turn_start", async (_event, ctx) => {
+    const state = getState(ctx);
+    await ensureBeforeSnapshotForTurn(ctx, state, state.pendingPromptText);
   });
 
   pi.on("turn_end", async (event, ctx) => {
@@ -1029,9 +1042,16 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       }
 
       const resultLeafId = ctx.sessionManager.getLeafId() ?? undefined;
+      const beforeSnapshot = findSnapshotById(ctx, state.pendingBeforeSnapshotId);
       const userEntry = findUserEntryAfter(ctx, state.pendingBeforeSnapshotId);
 
-      const commit = await createSnapshotCommit(pi, ctx, `after ${state.pendingTurnId}`, state);
+      let commit = getSnapshotCommit(beforeSnapshot);
+      if (!commit || await isWorkspaceDirtyAgainstCommit(pi, ctx, commit, state)) {
+        commit = await createSnapshotCommit(pi, ctx, `after ${state.pendingTurnId}`, state);
+      } else {
+        await logLine(ctx, `reuse before commit for after snapshot turn=${state.pendingTurnId} commit=${commit}`, state);
+      }
+
       pi.appendEntry<WorkspaceSnapshot>(SNAPSHOT_TYPE, {
         v: 1,
         kind: "after",

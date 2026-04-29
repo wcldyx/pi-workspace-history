@@ -1,6 +1,19 @@
-# workspace-history
+# pi-workspace-history
 
 [Chinese version / 中文版](./README.zh-CN.md)
+
+Real workspace undo/redo for Pi.
+
+Bring OpenCode style `/undo` to Pi, with the kind of workspace rollback safety that makes Claude Code feel trustworthy.
+
+![workspace-history demo](./demo.gif)
+
+## Why It Matters
+
+- Undo the real workspace, not just chat history
+- Roll back agent turns with confidence
+- Restore branch-specific workspace state with `/tree`
+- Protect manual edits with `/checkpoint`
 
 ## What It Is
 

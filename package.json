@@ -1,18 +1,26 @@
 {
   "name": "pi-workspace-history",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "type": "module",
-  "description": "Workspace history extension for @mariozechner/pi-coding-agent",
+  "description": "Real workspace undo/redo for Pi. Bring Claude Code style /rewind and OpenCode /undo safety to @mariozechner/pi-coding-agent.",
   "author": "wcldyx",
   "keywords": [
     "pi-package",
     "pi",
     "pi-plugin",
     "pi-extension",
+    "pi-agent",
+    "pi-coding-agent",
     "workspace-history",
     "undo",
     "redo",
-    "tree-navigation"
+    "rewind",
+    "rollback",
+    "snapshot",
+    "git-snapshot",
+    "time-machine",
+    "claude-code",
+    "opencode"
   ],
   "license": "MIT",
   "repository": {

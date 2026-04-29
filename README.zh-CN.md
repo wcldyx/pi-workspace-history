@@ -1,6 +1,19 @@
-# workspace-history
+# pi-workspace-history
 
 [English version](./README.md)
+
+给 Pi 补上真正可用的工作区级 Undo / Redo。
+
+把接近 OpenCode 的 `/undo` 体验带给 Pi，并补上类似 Claude Code 那种让人敢放心改代码的工作区回退安全感。
+
+![workspace-history 演示](./demo.gif)
+
+## 为什么值得用
+
+- 撤销的是整个工作区，不只是聊天记录
+- 让你敢放心让 Agent 真改代码
+- 通过 `/tree` 恢复历史分支对应的工作区状态
+- 通过 `/checkpoint` 保护手动修改
 
 ## 这是什么
 
