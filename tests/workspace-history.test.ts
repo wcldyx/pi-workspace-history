@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   AuthStorage,
+  type CustomEntry,
   createAgentSession,
   DefaultResourceLoader,
   getAgentDir,
@@ -12,6 +13,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@mariozechner/pi-coding-agent";
+import workspaceHistoryExtension, { rebuildTurnSnapshotsFromLegacyEntries } from "../.pi/extensions/workspace-history.ts";
 import {
   fauxAssistantMessage,
   fauxToolCall,
@@ -26,6 +28,18 @@ type TestContext = {
   authStorage: AuthStorage;
   settingsManager: SettingsManager;
   provider: ReturnType<typeof registerFauxProvider>;
+};
+
+type TurnSnapshotState = {
+  version: 1;
+  turns: Array<{
+    turnId: string;
+    userEntryId: string;
+    assistantEntryId: string;
+    beforeCommit: string;
+    afterCommit: string;
+    createdAt: string;
+  }>;
 };
 
 async function createContextForWorkspace(rootDir: string, cwd: string): Promise<TestContext> {
@@ -210,7 +224,50 @@ async function waitForText(filePath: string, expected: string, message: string):
   }, message);
 }
 
-function countSnapshots(session: Awaited<ReturnType<typeof createSession>>, kind?: string): number {
+function getTurnSnapshotFile(session: Awaited<ReturnType<typeof createSession>>, cwd: string): string {
+  const workspaceHash = createHash("sha256").update(path.normalize(cwd)).digest("hex").slice(0, 24);
+  return path.join(
+    getAgentDir(),
+    "state",
+    "workspace-history",
+    "workspaces",
+    workspaceHash,
+    "sessions",
+    session.sessionManager.getSessionId(),
+    "turn-snapshots.json",
+  );
+}
+
+async function readTurnSnapshots(session: Awaited<ReturnType<typeof createSession>>, cwd: string): Promise<TurnSnapshotState> {
+  try {
+    return JSON.parse(await readFile(getTurnSnapshotFile(session, cwd), "utf8")) as TurnSnapshotState;
+  } catch {
+    return { version: 1, turns: [] };
+  }
+}
+
+function getMessageText(entry: any): string | undefined {
+  if (entry?.type !== "message") {
+    return undefined;
+  }
+  const content = entry.message?.content;
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .filter((item) => item?.type === "text")
+      .map((item) => item.text)
+      .join("");
+  }
+  return undefined;
+}
+
+async function countSnapshots(session: Awaited<ReturnType<typeof createSession>>, cwd: string, kind?: string): Promise<number> {
+  if (kind === "after") {
+    return (await readTurnSnapshots(session, cwd)).turns.length;
+  }
+
   return session.sessionManager.getEntries().filter((entry) => {
     return (
       entry.type === "custom" &&
@@ -237,7 +294,7 @@ async function testUndoRedo(): Promise<void> {
     ]);
 
     await session.prompt("create hello.txt");
-    await waitFor(() => countSnapshots(session, "after") >= 1, "first-turn after snapshot was not created");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "first-turn after snapshot was not created");
     assert.equal(await exists(filePath), true, "file should exist after the first turn");
     assert.equal(normalizeEol(await readText(filePath)), "hello from turn 1\n");
 
@@ -259,9 +316,9 @@ async function testSessionStartDoesNotCreateBaselineEagerly(): Promise<void> {
   try {
     const session = await createSession(ctx);
 
-    assert.equal(countSnapshots(session), 0, "session start should not create baseline eagerly");
+    assert.equal(await countSnapshots(session, ctx.cwd), 0, "session start should not create baseline eagerly");
     await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.equal(countSnapshots(session), 0, "idle baseline warmup should not append snapshot entries before the first turn");
+    assert.equal(await countSnapshots(session, ctx.cwd), 0, "idle baseline warmup should not append snapshot entries before the first turn");
 
     ctx.provider.setResponses([
       fauxAssistantMessage([fauxToolCall("write", { path: "lazy.txt", content: "lazy baseline\n" })]),
@@ -269,9 +326,9 @@ async function testSessionStartDoesNotCreateBaselineEagerly(): Promise<void> {
     ]);
 
     await session.prompt("create lazy.txt");
-    await waitFor(() => countSnapshots(session, "after") >= 1, "after snapshot was not created for lazy baseline flow");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "after snapshot was not created for lazy baseline flow");
 
-    assert.equal(countSnapshots(session, "baseline") >= 1, true, "baseline should be created lazily before the first turn");
+    assert.equal(await countSnapshots(session, ctx.cwd, "baseline") >= 1, true, "baseline should be created lazily before the first turn");
 
     session.dispose();
   } finally {
@@ -304,14 +361,14 @@ async function testManualChangesProtectedAcrossUndo(): Promise<void> {
     ]);
 
     await session.prompt("create A.txt");
-    await waitFor(() => countSnapshots(session, "after") >= 1, "A turn after snapshot was not created");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "A turn after snapshot was not created");
     assert.equal(await exists(fileA), true);
 
     await rm(fileA, { force: true });
     assert.equal(await exists(fileA), false, "A should not exist after manual deletion");
 
     await session.prompt("create B.txt");
-    await waitFor(() => countSnapshots(session, "after") >= 2, "B turn after snapshot was not created");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 2, "B turn after snapshot was not created");
     assert.equal(await exists(fileB), true);
 
     await session.prompt("/undo");
@@ -341,7 +398,7 @@ async function testCheckpointAndTreeGuard(): Promise<void> {
     ]);
 
     await session.prompt("create checkpoint.txt");
-    await waitFor(() => countSnapshots(session, "after") >= 1, "checkpoint test after snapshot was not created");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "checkpoint test after snapshot was not created");
     assert.equal(normalizeEol(await readText(filePath)), "base\n");
 
     await writeFile(filePath, "manual edit\n", "utf8");
@@ -389,9 +446,9 @@ async function testRepeatedUndo(): Promise<void> {
     ]);
 
     await session.prompt("create A.txt");
-    await waitFor(() => countSnapshots(session, "after") >= 1, "A turn after snapshot was not created");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "A turn after snapshot was not created");
     await session.prompt("create B.txt and C.txt");
-    await waitFor(() => countSnapshots(session, "after") >= 2, "B/C turn after snapshot was not created");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 2, "B/C turn after snapshot was not created");
 
     assert.equal(await exists(fileA), true);
     assert.equal(await exists(fileB), true);
@@ -427,34 +484,32 @@ async function testTreeBranchSwitching(): Promise<void> {
     ]);
 
     await session.prompt("create branch.txt as A");
-    await waitFor(() => countSnapshots(session, "after") >= 1, "A branch after snapshot was not created");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "A branch after snapshot was not created");
     await session.prompt("change branch.txt to C");
-    await waitFor(() => countSnapshots(session, "after") >= 2, "C branch after snapshot was not created");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 2, "C branch after snapshot was not created");
 
-    const currentAfter = session.sessionManager
+    const cAssistant = session.sessionManager
       .getEntries()
-      .filter((entry) => entry.type === "custom" && entry.customType === "workspace-history.snapshot" && (entry as any).data?.kind === "after");
-    const cAfter = currentAfter[currentAfter.length - 1];
-    assert.ok(cAfter, "C after snapshot should exist");
+      .find((entry) => entry.type === "message" && entry.message.role === "assistant" && getMessageText(entry) === "created C branch state");
+    assert.ok(cAssistant, "C assistant message should exist");
 
     await session.prompt("/undo");
     await waitForText(fileA, "A\n", "after undoing back before C, the file should be A");
 
     await session.prompt("change branch.txt to D");
-    await waitFor(() => countSnapshots(session, "after") >= 3, "D branch after snapshot was not created");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 3, "D branch after snapshot was not created");
     assert.equal(normalizeEol(await readText(fileA)), "D\n", "D branch should write D");
 
-    const dAfter = session.sessionManager
+    const dAssistant = session.sessionManager
       .getEntries()
-      .filter((entry) => entry.type === "custom" && entry.customType === "workspace-history.snapshot" && (entry as any).data?.kind === "after")
-      .at(-1);
-    assert.ok(dAfter, "D after snapshot should exist");
+      .find((entry) => entry.type === "message" && entry.message.role === "assistant" && getMessageText(entry) === "created D branch state");
+    assert.ok(dAssistant, "D assistant message should exist");
 
-    const cTreeResult = await session.navigateTree(cAfter!.id, { summarize: false });
+    const cTreeResult = await session.navigateTree(cAssistant!.id, { summarize: false });
     assert.equal(cTreeResult.cancelled, false, "switching back to C branch should not be cancelled");
     assert.equal(normalizeEol(await readText(fileA)), "C\n", "workspace should restore C when switching back to C branch");
 
-    const dTreeResult = await session.navigateTree(dAfter!.id, { summarize: false });
+    const dTreeResult = await session.navigateTree(dAssistant!.id, { summarize: false });
     assert.equal(dTreeResult.cancelled, false, "switching back to D branch should not be cancelled");
     assert.equal(normalizeEol(await readText(fileA)), "D\n", "workspace should restore D when switching back to D branch");
 
@@ -476,7 +531,7 @@ async function testUndoDoesNotLeakAcrossSessions(): Promise<void> {
     ]);
 
     await session1.prompt("create session-a.txt");
-    await waitFor(() => countSnapshots(session1, "after") >= 1, "session1 after snapshot was not created");
+    await waitFor(async () => await countSnapshots(session1, ctx1.cwd, "after") >= 1, "session1 after snapshot was not created");
     assert.equal(normalizeEol(await readText(fileA)), "from session 1\n");
     session1.dispose();
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -497,6 +552,101 @@ async function testUndoDoesNotLeakAcrossSessions(): Promise<void> {
   }
 }
 
+async function testUndoWorksFromTreeSelectedUserNode(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    const filePath = path.join(ctx.cwd, "tree-undo.txt");
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "tree-undo.txt", content: "turn one\n" })]),
+      fauxAssistantMessage("created tree undo file"),
+    ]);
+
+    await session.prompt("create tree-undo.txt");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "tree undo after snapshot was not created");
+    assert.equal(normalizeEol(await readText(filePath)), "turn one\n");
+
+    const userEntry = session.sessionManager
+      .getEntries()
+      .find((entry) => entry.type === "message" && entry.message.role === "user" && getMessageText(entry) === "create tree-undo.txt");
+    assert.ok(userEntry, "user entry should exist for tree undo test");
+
+    const nav = await session.navigateTree(userEntry!.id, { summarize: false });
+    assert.equal(nav.cancelled, false, "navigating to the user node should succeed");
+
+    await session.prompt("/undo");
+    await waitForExists(filePath, false, "file should be removed when undo runs from a tree-selected user node");
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testLegacySnapshotEntriesRebuildTurnSnapshots(): Promise<void> {
+  const ctx1 = await createContext();
+  try {
+    const session1 = await createSession(ctx1);
+    const filePath = path.join(ctx1.cwd, "legacy-fallback.txt");
+
+    ctx1.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "legacy-fallback.txt", content: "legacy\n" })]),
+      fauxAssistantMessage("created legacy fallback file"),
+    ]);
+
+    await session1.prompt("create legacy-fallback.txt");
+    await waitFor(async () => await countSnapshots(session1, ctx1.cwd, "after") >= 1, "legacy fallback after snapshot was not created");
+    assert.equal(normalizeEol(await readText(filePath)), "legacy\n");
+
+    const entries = session1.sessionManager.getEntries();
+    const baseline = entries.find((entry) => entry.type === "custom" && entry.customType === "workspace-history.snapshot" && (entry as any).data?.kind === "baseline");
+    const userEntry = entries.find((entry) => entry.type === "message" && entry.message.role === "user" && getMessageText(entry) === "create legacy-fallback.txt");
+    const assistantEntry = entries.find((entry) => entry.type === "message" && entry.message.role === "assistant" && getMessageText(entry) === "created legacy fallback file");
+    const turnSnapshots = await readTurnSnapshots(session1, ctx1.cwd);
+    const latestTurn = turnSnapshots.turns.at(-1);
+
+    assert.ok(baseline, "baseline snapshot should exist for legacy fallback test");
+    assert.ok(userEntry, "user entry should exist for legacy fallback test");
+    assert.ok(assistantEntry, "assistant entry should exist for legacy fallback test");
+    assert.ok(latestTurn, "turn snapshot should exist for legacy fallback test");
+
+    const legacyEntries = entries.filter((entry) => entry !== baseline) as Array<any>;
+    legacyEntries.push({
+      type: "custom",
+      customType: "workspace-history.snapshot",
+      id: `legacy-after-${Date.now()}`,
+      parentId: assistantEntry!.id,
+      timestamp: Date.now(),
+      data: {
+        v: 1,
+        kind: "after",
+        commit: latestTurn!.afterCommit,
+        turnId: latestTurn!.turnId,
+        beforeSnapshotId: baseline!.id,
+        userEntryId: userEntry!.id,
+        resultLeafId: assistantEntry!.id,
+        createdAt: latestTurn!.createdAt,
+      },
+    } satisfies CustomEntry<any>);
+
+    const rebuilt = rebuildTurnSnapshotsFromLegacyEntries({
+      sessionManager: {
+        getEntries: () => [baseline!, ...legacyEntries],
+        getEntry: (id: string) => [baseline!, ...legacyEntries].find((entry) => entry.id === id),
+      },
+    } as any);
+
+    assert.equal(rebuilt.turns.length >= 1, true, "legacy snapshot entries should rebuild at least one turn snapshot");
+    assert.equal(rebuilt.turns.at(-1)?.userEntryId, userEntry!.id, "rebuilt legacy turn should preserve user entry id");
+    assert.equal(rebuilt.turns.at(-1)?.assistantEntryId, assistantEntry!.id, "rebuilt legacy turn should preserve assistant entry id");
+
+    session1.dispose();
+  } finally {
+    await disposeContext(ctx1);
+  }
+}
+
 async function testPiFilesAreSnapshotManagedExceptInternalState(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -509,7 +659,7 @@ async function testPiFilesAreSnapshotManagedExceptInternalState(): Promise<void>
     ]);
 
     await session.prompt("create .pi/notes.txt");
-    await waitFor(() => countSnapshots(session, "after") >= 1, ".pi file after snapshot was not created");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, ".pi file after snapshot was not created");
     assert.equal(normalizeEol(await readText(piFile)), "pi managed file\n");
 
     await session.prompt("/undo");
@@ -535,7 +685,7 @@ async function testHistoryIsStoredOutsideWorkspace(): Promise<void> {
     ]);
 
     await session.prompt("create outside.txt");
-    await waitFor(() => countSnapshots(session, "after") >= 1, "outside storage after snapshot was not created");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "outside storage after snapshot was not created");
 
     const legacyDir = path.join(ctx.cwd, ".pi", "workspace-history");
     assert.equal(await pathExists(legacyDir), false, "legacy workspace history dir should not be created in workspace");
@@ -562,7 +712,7 @@ async function testUndoAndRedoBlockOnUnsnapshottedManualChanges(): Promise<void>
     ]);
 
     await session.prompt("create guard.txt");
-    await waitFor(() => countSnapshots(session, "after") >= 1, "guard after snapshot was not created");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "guard after snapshot was not created");
 
     await writeFile(filePath, "manual edit\n", "utf8");
     const undoLeafBefore = session.sessionManager.getLeafId();
@@ -608,10 +758,10 @@ async function testGitignoreStopsManagingIgnoredPaths(): Promise<void> {
     ]);
 
     await session.prompt("create generated.txt");
-    await waitFor(() => countSnapshots(session, "after") >= 1, "generated file after snapshot was not created");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "generated file after snapshot was not created");
 
     await session.prompt("ignore generated.txt in .gitignore");
-    await waitFor(() => countSnapshots(session, "after") >= 2, ".gitignore update after snapshot was not created");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 2, ".gitignore update after snapshot was not created");
 
     await writeFile(ignoredFilePath, "manual ignored edit\n", "utf8");
     await session.prompt("/undo");
@@ -637,7 +787,7 @@ async function testRestoreFailureDoesNotDeleteCurrentWorkspace(): Promise<void> 
     ]);
 
     await session.prompt("create safe.txt");
-    await waitFor(() => countSnapshots(session, "after") >= 1, "safe file after snapshot was not created");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "safe file after snapshot was not created");
 
     const sessionId = session.sessionManager.getSessionId();
     const workspaceHash = createHash("sha256").update(ctx.cwd).digest("hex").slice(0, 24);
@@ -671,6 +821,8 @@ async function main(): Promise<void> {
     { name: "checkpoint and dirty tree guard", run: testCheckpointAndTreeGuard },
     { name: "tree switching restores branch-specific workspace", run: testTreeBranchSwitching },
     { name: "undo does not leak across sessions", run: testUndoDoesNotLeakAcrossSessions },
+    { name: "undo works from tree-selected user node", run: testUndoWorksFromTreeSelectedUserNode },
+    { name: "legacy snapshot entries rebuild turn snapshots", run: testLegacySnapshotEntriesRebuildTurnSnapshots },
     { name: ".pi files are managed except internal state", run: testPiFilesAreSnapshotManagedExceptInternalState },
     { name: "history is stored outside workspace", run: testHistoryIsStoredOutsideWorkspace },
     { name: "undo and redo block on unsnapshotted manual changes", run: testUndoAndRedoBlockOnUnsnapshottedManualChanges },

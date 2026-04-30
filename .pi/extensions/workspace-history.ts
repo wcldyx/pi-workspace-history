@@ -36,11 +36,27 @@ interface WorkspaceSnapshot {
   commit: string;
   turnId?: string;
   promptText?: string;
-  beforeSnapshotId?: string;
   userEntryId?: string;
+  assistantEntryId?: string;
+  beforeSnapshotId?: string;
   resultLeafId?: string;
   label?: string;
   createdAt: string;
+}
+
+interface TurnSnapshotRecord {
+  turnId: string;
+  promptText?: string;
+  userEntryId: string;
+  assistantEntryId: string;
+  beforeCommit: string;
+  afterCommit: string;
+  createdAt: string;
+}
+
+interface TurnSnapshotState {
+  version: 1;
+  turns: TurnSnapshotRecord[];
 }
 
 interface RedoItem {
@@ -55,7 +71,7 @@ interface RedoState {
 
 interface RuntimeState {
   pendingTurnId?: string;
-  pendingBeforeSnapshotId?: string;
+  pendingBeforeCommit?: string;
   pendingPromptText?: string;
   internalNavigation?: "undo" | "redo";
   cachedSettings?: WorkspaceHistorySettings;
@@ -70,11 +86,12 @@ interface RuntimeState {
   cachedSnapshotIgnoreMatcher?: Ignore;
   snapshotWritePromise?: Promise<unknown>;
   beforeSnapshotPromise?: Promise<void>;
+  turnSnapshots?: TurnSnapshotState;
 }
 
 interface NavigationPrecheckResult {
   currentLeafId?: string;
-  currentSnapshot?: CustomEntry<WorkspaceSnapshot>;
+  currentSnapshot?: WorkspaceSnapshot | CustomEntry<WorkspaceSnapshot>;
 }
 
 interface WorkspaceHistorySettings {
@@ -91,6 +108,7 @@ interface WorkspaceStoragePaths {
   sessionRoot: string;
   shadowGitDir: string;
   redoFile: string;
+  turnSnapshotsFile: string;
   workspaceMetaFile: string;
   sessionMetaFile: string;
   logFile: string;
@@ -233,6 +251,7 @@ async function buildWorkspaceStoragePaths(ctx: ExtensionContext, settings: Works
     sessionRoot,
     shadowGitDir: path.join(sessionRoot, "repo.git"),
     redoFile: path.join(sessionRoot, "redo.json"),
+    turnSnapshotsFile: path.join(sessionRoot, "turn-snapshots.json"),
     workspaceMetaFile: path.join(workspaceRoot, "meta.json"),
     sessionMetaFile: path.join(sessionRoot, "meta.json"),
     logFile: path.join(settings.storageDir, "logs", "timemachine.log"),
@@ -661,6 +680,62 @@ async function writeRedoState(ctx: ExtensionContext, redoState: RedoState, state
   await writeFile(paths.redoFile, `${JSON.stringify(redoState, null, 2)}\n`, "utf8");
 }
 
+export function rebuildTurnSnapshotsFromLegacyEntries(ctx: ExtensionContext): TurnSnapshotState {
+  const turns: TurnSnapshotRecord[] = [];
+  for (const entry of getSnapshotEntries(ctx)) {
+    if (!hasSnapshotData(entry) || entry.data.kind !== "after") {
+      continue;
+    }
+
+    const userEntryId = entry.data.userEntryId;
+    const assistantEntryId = entry.data.assistantEntryId ?? entry.data.resultLeafId;
+    const beforeCommit = getSnapshotCommit(findSnapshotById(ctx, entry.data.beforeSnapshotId));
+    if (!userEntryId || !assistantEntryId || !beforeCommit) {
+      continue;
+    }
+
+    turns.push({
+      turnId: entry.data.turnId ?? entry.id,
+      promptText: entry.data.promptText,
+      userEntryId,
+      assistantEntryId,
+      beforeCommit,
+      afterCommit: entry.data.commit,
+      createdAt: entry.data.createdAt,
+    });
+  }
+
+  turns.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  return { version: 1, turns };
+}
+
+async function readTurnSnapshotState(ctx: ExtensionContext, state?: RuntimeState): Promise<TurnSnapshotState> {
+  if (state?.turnSnapshots) {
+    return state.turnSnapshots;
+  }
+
+  const paths = await getWorkspaceStoragePaths(ctx, state);
+  const snapshots = (await readJsonFile<TurnSnapshotState>(paths.turnSnapshotsFile)) ?? rebuildTurnSnapshotsFromLegacyEntries(ctx);
+  const normalized = snapshots.turns.length > 0 ? snapshots : {
+    version: 1 as const,
+    turns: [],
+  };
+
+  if (state) {
+    state.turnSnapshots = normalized;
+  }
+
+  return normalized;
+}
+
+async function writeTurnSnapshotState(ctx: ExtensionContext, snapshots: TurnSnapshotState, state?: RuntimeState): Promise<void> {
+  const paths = await ensureStorageDirs(ctx, state);
+  await writeJsonFile(paths.turnSnapshotsFile, snapshots);
+  if (state) {
+    state.turnSnapshots = snapshots;
+  }
+}
+
 async function clearRedoStack(ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
   const sessionId = ctx.sessionManager.getSessionId();
   await writeRedoState(ctx, {
@@ -703,6 +778,10 @@ async function peekRedoTarget(ctx: ExtensionContext, state?: RuntimeState): Prom
 
 function getEntries(ctx: ExtensionContext): SessionEntry[] {
   return ctx.sessionManager.getEntries();
+}
+
+function getTurnSnapshots(state: RuntimeState | undefined): TurnSnapshotRecord[] {
+  return state?.turnSnapshots?.turns ?? [];
 }
 
 function isSnapshotEntry(entry: SessionEntry | undefined): entry is CustomEntry<WorkspaceSnapshot> {
@@ -748,6 +827,29 @@ function isAssistantTurnMessage(message: unknown): message is { role: string; co
   return !!message && typeof message === "object" && "role" in message && (message as { role?: unknown }).role === "assistant";
 }
 
+function getResolvedSnapshotData(
+  snapshot: WorkspaceSnapshot | CustomEntry<WorkspaceSnapshot> | undefined,
+): WorkspaceSnapshot | undefined {
+  if (!snapshot) {
+    return undefined;
+  }
+  if ("type" in snapshot) {
+    return isSnapshotEntry(snapshot) && hasSnapshotData(snapshot) ? snapshot.data : undefined;
+  }
+  return snapshot;
+}
+
+function findLatestUserMessageOnBranch(ctx: ExtensionContext): SessionMessageEntry | undefined {
+  const branch = ctx.sessionManager.getBranch();
+  for (let i = branch.length - 1; i >= 0; i -= 1) {
+    const entry = branch[i];
+    if (isUserMessageEntry(entry)) {
+      return entry;
+    }
+  }
+  return undefined;
+}
+
 function findSnapshotById(ctx: ExtensionContext, snapshotId: string | undefined): CustomEntry<WorkspaceSnapshot> | undefined {
   if (!snapshotId) {
     return undefined;
@@ -761,28 +863,125 @@ function getSnapshotCommit(entry: CustomEntry<WorkspaceSnapshot> | undefined): s
   return hasSnapshotData(entry) ? entry.data.commit : undefined;
 }
 
-function findLastAfterSnapshot(ctx: ExtensionContext): CustomEntry<WorkspaceSnapshot> | undefined {
-  const branch = ctx.sessionManager.getBranch();
-  for (let i = branch.length - 1; i >= 0; i -= 1) {
-    const entry = branch[i];
-    if (isSnapshotEntry(entry) && hasSnapshotData(entry) && entry.data.kind === "after") {
-      return entry;
+function findLastAfterSnapshot(ctx: ExtensionContext, state?: RuntimeState): WorkspaceSnapshot | undefined {
+  let currentId = ctx.sessionManager.getLeafId();
+  while (currentId) {
+    const entry = ctx.sessionManager.getEntry(currentId);
+    if (!entry) {
+      return undefined;
+    }
+
+    const resolved = findAfterSnapshotForMessageAnchor(ctx, entry, state);
+    if (resolved) {
+      return resolved;
+    }
+
+    currentId = entry.parentId ?? null;
+  }
+
+  const turns = getTurnSnapshots(state);
+  const turn = turns[turns.length - 1];
+  return turn ? {
+    v: 1,
+    kind: "after",
+    commit: turn.afterCommit,
+    turnId: turn.turnId,
+    promptText: turn.promptText,
+    userEntryId: turn.userEntryId,
+    assistantEntryId: turn.assistantEntryId,
+    createdAt: turn.createdAt,
+  } : undefined;
+}
+
+function isSlashCommandPrompt(promptText: string | undefined): boolean {
+  return typeof promptText === "string" && promptText.trimStart().startsWith("/");
+}
+
+function findUndoTargetAfterSnapshot(ctx: ExtensionContext, state?: RuntimeState): WorkspaceSnapshot | undefined {
+  const currentLeafId = ctx.sessionManager.getLeafId();
+  if (currentLeafId) {
+    const currentEntry = ctx.sessionManager.getEntry(currentLeafId);
+    if (currentEntry && !isSnapshotEntry(currentEntry)) {
+      const resolved = findAfterSnapshotForMessageAnchor(ctx, currentEntry, state);
+      if (resolved) {
+        return resolved;
+      }
     }
   }
+
+  return findLastAfterSnapshot(ctx, state);
+}
+
+function findTurnSnapshotByAssistantEntryId(assistantEntryId: string, state?: RuntimeState): TurnSnapshotRecord | undefined {
+  return getTurnSnapshots(state).find((entry) => entry.assistantEntryId === assistantEntryId);
+}
+
+function findTurnSnapshotByUserEntryId(userEntryId: string, state?: RuntimeState): TurnSnapshotRecord | undefined {
+  return getTurnSnapshots(state).find((entry) => entry.userEntryId === userEntryId);
+}
+
+function isAssistantMessageEntry(entry: SessionEntry | undefined): entry is SessionMessageEntry {
+  return entry?.type === "message" && entry.message.role === "assistant";
+}
+
+function isMessageEntry(entry: SessionEntry | undefined): entry is SessionMessageEntry {
+  return entry?.type === "message";
+}
+
+function findAfterSnapshotForMessageAnchor(
+  ctx: ExtensionContext,
+  entry: SessionEntry | undefined,
+  state?: RuntimeState,
+): WorkspaceSnapshot | undefined {
+  if (!entry || entry.type !== "message") {
+    return undefined;
+  }
+
+  const messageEntry = entry as SessionMessageEntry & { id: string; message: { role: string } };
+
+  if (messageEntry.message.role === "user") {
+    const turn = findTurnSnapshotByUserEntryId(messageEntry.id, state);
+    return turn ? {
+      v: 1,
+      kind: "after",
+      commit: turn.afterCommit,
+      turnId: turn.turnId,
+      promptText: turn.promptText,
+      userEntryId: turn.userEntryId,
+      assistantEntryId: turn.assistantEntryId,
+      createdAt: turn.createdAt,
+    } : undefined;
+  }
+
+  if (messageEntry.message.role === "assistant") {
+    const turn = findTurnSnapshotByAssistantEntryId(messageEntry.id, state);
+    return turn ? {
+      v: 1,
+      kind: "after",
+      commit: turn.afterCommit,
+      turnId: turn.turnId,
+      promptText: turn.promptText,
+      userEntryId: turn.userEntryId,
+      assistantEntryId: turn.assistantEntryId,
+      createdAt: turn.createdAt,
+    } : undefined;
+  }
+
   return undefined;
 }
 
-function findAfterSnapshotByResultLeafId(ctx: ExtensionContext, resultLeafId: string): CustomEntry<WorkspaceSnapshot> | undefined {
-  return getSnapshotEntries(ctx).find(
-    (entry) => hasSnapshotData(entry) && entry.data.kind === "after" && entry.data.resultLeafId === resultLeafId,
-  );
-}
-
-function findBeforeSnapshotForUserEntry(ctx: ExtensionContext, userEntryId: string): CustomEntry<WorkspaceSnapshot> | undefined {
-  const after = getSnapshotEntries(ctx).find(
-    (entry) => hasSnapshotData(entry) && entry.data.kind === "after" && entry.data.userEntryId === userEntryId,
-  );
-  return hasSnapshotData(after) ? findSnapshotById(ctx, after.data.beforeSnapshotId) : undefined;
+function findBeforeSnapshotForUserEntry(userEntryId: string, state?: RuntimeState): WorkspaceSnapshot | undefined {
+  const turn = findTurnSnapshotByUserEntryId(userEntryId, state);
+  return turn ? {
+    v: 1,
+    kind: "before",
+    commit: turn.beforeCommit,
+    turnId: turn.turnId,
+    promptText: turn.promptText,
+    userEntryId: turn.userEntryId,
+    assistantEntryId: turn.assistantEntryId,
+    createdAt: turn.createdAt,
+  } : undefined;
 }
 
 function findNearestSnapshotOnChain(ctx: ExtensionContext, startId: string | null | undefined): CustomEntry<WorkspaceSnapshot> | undefined {
@@ -803,7 +1002,8 @@ function findNearestSnapshotOnChain(ctx: ExtensionContext, startId: string | nul
 function resolveSnapshotForTreeTarget(
   ctx: ExtensionContext,
   targetId: string,
-): CustomEntry<WorkspaceSnapshot> | undefined {
+  state?: RuntimeState,
+): WorkspaceSnapshot | CustomEntry<WorkspaceSnapshot> | undefined {
   const target = ctx.sessionManager.getEntry(targetId);
   if (!target) {
     return undefined;
@@ -814,27 +1014,10 @@ function resolveSnapshotForTreeTarget(
   }
 
   if (isUserMessageEntry(target)) {
-    return findBeforeSnapshotForUserEntry(ctx, target.id) ?? findNearestSnapshotOnChain(ctx, target.parentId);
+    return findBeforeSnapshotForUserEntry(target.id, state) ?? findNearestSnapshotOnChain(ctx, target.parentId);
   }
 
-  return findAfterSnapshotByResultLeafId(ctx, targetId) ?? findNearestSnapshotOnChain(ctx, targetId);
-}
-
-function findUserEntryAfter(ctx: ExtensionContext, beforeSnapshotId: string): SessionMessageEntry | undefined {
-  const branch = ctx.sessionManager.getBranch();
-  const startIndex = branch.findIndex((entry) => entry.id === beforeSnapshotId);
-  if (startIndex === -1) {
-    return undefined;
-  }
-
-  for (let i = startIndex + 1; i < branch.length; i += 1) {
-    const entry = branch[i];
-    if (isUserMessageEntry(entry)) {
-      return entry;
-    }
-  }
-
-  return undefined;
+  return findAfterSnapshotForMessageAnchor(ctx, target, state) ?? findNearestSnapshotOnChain(ctx, targetId);
 }
 
 async function ensureBaselineSnapshot(
@@ -843,8 +1026,8 @@ async function ensureBaselineSnapshot(
   state?: RuntimeState,
   commitOverride?: string,
 ): Promise<void> {
-  const existing = getSnapshotEntries(ctx);
-  if (existing.length > 0) {
+  const existing = getSnapshotEntries(ctx).find((entry) => hasSnapshotData(entry) && entry.data.kind === "baseline");
+  if (existing) {
     return;
   }
 
@@ -899,13 +1082,14 @@ async function isWorkspaceDirtyAgainstCommit(
 async function isWorkspaceDirtyAgainstSnapshot(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
-  snapshot: CustomEntry<WorkspaceSnapshot> | undefined,
+  snapshot: WorkspaceSnapshot | CustomEntry<WorkspaceSnapshot> | undefined,
   state?: RuntimeState,
 ): Promise<boolean> {
-  if (!hasSnapshotData(snapshot)) {
+  const snapshotData = getResolvedSnapshotData(snapshot);
+  if (!snapshotData) {
     return false;
   }
-  return isWorkspaceDirtyAgainstCommit(pi, ctx, snapshot.data.commit, state);
+  return isWorkspaceDirtyAgainstCommit(pi, ctx, snapshotData.commit, state);
 }
 
 async function restoreResolvedSnapshot(
@@ -913,17 +1097,18 @@ async function restoreResolvedSnapshot(
   ctx: ExtensionContext,
   source: string,
   targetId: string,
-  snapshot: CustomEntry<WorkspaceSnapshot>,
+  snapshot: WorkspaceSnapshot | CustomEntry<WorkspaceSnapshot>,
   state?: RuntimeState,
 ): Promise<void> {
-  if (!hasSnapshotData(snapshot)) {
+  const snapshotData = getResolvedSnapshotData(snapshot);
+  if (!snapshotData) {
     throw new Error("snapshot data missing");
   }
 
-  await restoreSnapshotCommitSafely(pi, ctx, snapshot.data.commit, state);
+  await restoreSnapshotCommitSafely(pi, ctx, snapshotData.commit, state);
   await logLine(
     ctx,
-    `restore source=${source} target=${targetId} snapshot=${snapshot.id} kind=${snapshot.data.kind} commit=${snapshot.data.commit} ok`,
+    `restore source=${source} target=${targetId} kind=${snapshotData.kind} commit=${snapshotData.commit} ok`,
     state,
   );
 }
@@ -953,7 +1138,7 @@ async function ensureNoUnsnapshottedChanges(
   state?: RuntimeState,
 ): Promise<NavigationPrecheckResult | undefined> {
   const currentLeafId = ctx.sessionManager.getLeafId() ?? undefined;
-  const currentSnapshot = currentLeafId ? resolveSnapshotForTreeTarget(ctx, currentLeafId) : undefined;
+  const currentSnapshot = currentLeafId ? resolveSnapshotForTreeTarget(ctx, currentLeafId, state) : undefined;
 
   try {
     const dirty = await isWorkspaceDirtyAgainstSnapshot(pi, ctx, currentSnapshot, state);
@@ -985,7 +1170,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
   }
 
   function scheduleBaselineWarmup(ctx: ExtensionContext, state: RuntimeState): void {
-    if (state.baselineWarmupPromise || state.warmedBaselineCommit || getSnapshotEntries(ctx).length > 0) {
+    if (state.baselineWarmupPromise || state.warmedBaselineCommit || getSnapshotEntries(ctx).some((entry) => hasSnapshotData(entry) && entry.data.kind === "baseline")) {
       return;
     }
 
@@ -995,12 +1180,12 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       setTimeout(() => {
         void (async () => {
           try {
-            if (state.baselineWarmupGeneration !== generation || getSnapshotEntries(ctx).length > 0) {
+            if (state.baselineWarmupGeneration !== generation || getSnapshotEntries(ctx).some((entry) => hasSnapshotData(entry) && entry.data.kind === "baseline")) {
               return;
             }
 
             const commit = await createSnapshotCommit(pi, ctx, "baseline warmup", state);
-            if (state.baselineWarmupGeneration !== generation || getSnapshotEntries(ctx).length > 0) {
+            if (state.baselineWarmupGeneration !== generation || getSnapshotEntries(ctx).some((entry) => hasSnapshotData(entry) && entry.data.kind === "baseline")) {
               return;
             }
 
@@ -1024,7 +1209,11 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state: RuntimeState,
     promptText?: string,
   ): Promise<void> {
-    if (state.pendingTurnId || state.pendingBeforeSnapshotId) {
+    if (isSlashCommandPrompt(promptText)) {
+      return;
+    }
+
+    if (state.pendingTurnId || state.pendingBeforeCommit) {
       return;
     }
 
@@ -1037,7 +1226,8 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       await clearRedoStack(ctx, state);
 
       const turnId = randomUUID();
-      const isFirstSnapshot = getSnapshotEntries(ctx).length === 0;
+      const hasBaseline = getSnapshotEntries(ctx).some((entry) => hasSnapshotData(entry) && entry.data.kind === "baseline");
+      const isFirstSnapshot = !hasBaseline;
       let commit: string;
 
       if (isFirstSnapshot) {
@@ -1058,21 +1248,12 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         commit = await createSnapshotCommit(pi, ctx, `before ${turnId}`, state);
       }
 
-      pi.appendEntry<WorkspaceSnapshot>(SNAPSHOT_TYPE, {
-        v: 1,
-        kind: "before",
-        commit,
-        turnId,
-        promptText,
-        createdAt: new Date().toISOString(),
-      });
-
       state.pendingTurnId = turnId;
-      state.pendingBeforeSnapshotId = ctx.sessionManager.getLeafId() ?? undefined;
+      state.pendingBeforeCommit = commit;
 
       await logLine(
         ctx,
-        `create before snapshot turn=${turnId} entry=${state.pendingBeforeSnapshotId} commit=${commit} leaf=${ctx.sessionManager.getLeafId()}`,
+        `create before snapshot turn=${turnId} commit=${commit} leaf=${ctx.sessionManager.getLeafId()}`,
         state,
       );
     })();
@@ -1091,7 +1272,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     const state = getState(ctx);
     state.pendingTurnId = undefined;
-    state.pendingBeforeSnapshotId = undefined;
+    state.pendingBeforeCommit = undefined;
     state.pendingPromptText = undefined;
     state.internalNavigation = undefined;
     state.initialSnapshotCommit = undefined;
@@ -1104,6 +1285,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     await getWorkspaceHistorySettings(ctx, state);
     await getWorkspaceStoragePaths(ctx, state);
     await touchWorkspaceAndSessionMeta(ctx, state);
+    await readTurnSnapshotState(ctx, state);
     scheduleCleanup(ctx, state);
     await ensureShadowRepo(pi, ctx, state);
     scheduleBaselineWarmup(ctx, state);
@@ -1118,13 +1300,16 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
   pi.on("turn_start", async (_event, ctx) => {
     const state = getState(ctx);
+    if (isSlashCommandPrompt(state.pendingPromptText)) {
+      return;
+    }
     await ensureBeforeSnapshotForTurn(ctx, state, state.pendingPromptText);
   });
 
   pi.on("turn_end", async (event, ctx) => {
     const state = getState(ctx);
     try {
-      if (!state.pendingTurnId || !state.pendingBeforeSnapshotId) {
+      if (!state.pendingTurnId || !state.pendingBeforeCommit) {
         return;
       }
 
@@ -1133,37 +1318,49 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         return;
       }
 
-      const resultLeafId = ctx.sessionManager.getLeafId() ?? undefined;
-      const beforeSnapshot = findSnapshotById(ctx, state.pendingBeforeSnapshotId);
-      const userEntry = findUserEntryAfter(ctx, state.pendingBeforeSnapshotId);
+      const assistantEntry = ctx.sessionManager.getLeafId()
+        ? ctx.sessionManager.getEntry(ctx.sessionManager.getLeafId() as string)
+        : undefined;
+      if (!isAssistantMessageEntry(assistantEntry)) {
+        await logLine(ctx, `skip after snapshot: leaf is not assistant message turn=${state.pendingTurnId}`, state);
+        return;
+      }
 
-      let commit = getSnapshotCommit(beforeSnapshot);
+      const userEntry = findLatestUserMessageOnBranch(ctx);
+      if (!userEntry) {
+        await logLine(ctx, `skip after snapshot: no user entry found turn=${state.pendingTurnId}`, state);
+        return;
+      }
+
+      let commit = state.pendingBeforeCommit;
       if (!commit || await isWorkspaceDirtyAgainstCommit(pi, ctx, commit, state)) {
         commit = await createSnapshotCommit(pi, ctx, `after ${state.pendingTurnId}`, state);
       } else {
         await logLine(ctx, `reuse before commit for after snapshot turn=${state.pendingTurnId} commit=${commit}`, state);
       }
 
-      pi.appendEntry<WorkspaceSnapshot>(SNAPSHOT_TYPE, {
-        v: 1,
-        kind: "after",
-        commit,
+      const snapshots = await readTurnSnapshotState(ctx, state);
+      const createdAt = new Date().toISOString();
+      snapshots.turns = snapshots.turns.filter((entry) => entry.turnId !== state.pendingTurnId);
+      snapshots.turns.push({
         turnId: state.pendingTurnId,
-        beforeSnapshotId: state.pendingBeforeSnapshotId,
-        userEntryId: userEntry?.id,
-        resultLeafId,
-        createdAt: new Date().toISOString(),
+        promptText: state.pendingPromptText,
+        userEntryId: userEntry.id,
+        assistantEntryId: assistantEntry.id,
+        beforeCommit: state.pendingBeforeCommit,
+        afterCommit: commit,
+        createdAt,
       });
+      await writeTurnSnapshotState(ctx, snapshots, state);
 
-      const afterSnapshotId = ctx.sessionManager.getLeafId();
       await logLine(
         ctx,
-        `create after snapshot turn=${state.pendingTurnId} entry=${afterSnapshotId} resultLeaf=${resultLeafId} userEntry=${userEntry?.id} commit=${commit}`,
+        `create after snapshot turn=${state.pendingTurnId} userEntry=${userEntry.id} assistantEntry=${assistantEntry.id} beforeCommit=${state.pendingBeforeCommit} afterCommit=${commit}`,
         state,
       );
 
       state.pendingTurnId = undefined;
-      state.pendingBeforeSnapshotId = undefined;
+      state.pendingBeforeCommit = undefined;
       state.pendingPromptText = undefined;
     } catch (error) {
       await logLine(ctx, `after snapshot failed error=${String(error)}`, state);
@@ -1173,17 +1370,17 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
   pi.on("agent_end", async (_event, ctx) => {
     const state = getState(ctx);
-    if (!state.pendingTurnId && !state.pendingBeforeSnapshotId && !state.pendingPromptText) {
+    if (!state.pendingTurnId && !state.pendingBeforeCommit && !state.pendingPromptText) {
       return;
     }
 
     await logLine(
       ctx,
-      `clear pending turn without after snapshot turn=${state.pendingTurnId} beforeSnapshot=${state.pendingBeforeSnapshotId}`,
+      `clear pending turn without after snapshot turn=${state.pendingTurnId} beforeCommit=${state.pendingBeforeCommit}`,
       state,
     );
     state.pendingTurnId = undefined;
-    state.pendingBeforeSnapshotId = undefined;
+    state.pendingBeforeCommit = undefined;
     state.pendingPromptText = undefined;
   });
 
@@ -1201,7 +1398,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     }
 
     const currentLeafId = ctx.sessionManager.getLeafId();
-    const currentSnapshot = currentLeafId ? resolveSnapshotForTreeTarget(ctx, currentLeafId) : undefined;
+    const currentSnapshot = currentLeafId ? resolveSnapshotForTreeTarget(ctx, currentLeafId, state) : undefined;
 
     try {
       const dirty = await isWorkspaceDirtyAgainstSnapshot(pi, ctx, currentSnapshot, state);
@@ -1215,20 +1412,19 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       return { cancel: true };
     }
 
-    const snapshot = resolveSnapshotForTreeTarget(ctx, event.preparation.targetId);
-    if (!hasSnapshotData(snapshot)) {
+    const snapshot = resolveSnapshotForTreeTarget(ctx, event.preparation.targetId, state);
+    const snapshotData = getResolvedSnapshotData(snapshot);
+    if (!snapshotData) {
       ctx.ui.notify("This history node has no workspace snapshot. Cannot restore precisely.", "error");
       return { cancel: true };
     }
 
-    const snapshotData = snapshot.data;
-
     try {
-      await restoreResolvedSnapshot(pi, ctx, state.internalNavigation ?? "tree", event.preparation.targetId, snapshot, state);
+      await restoreResolvedSnapshot(pi, ctx, state.internalNavigation ?? "tree", event.preparation.targetId, snapshotData, state);
     } catch (error) {
       await logLine(
         ctx,
-        `restore source=${state.internalNavigation ?? "tree"} target=${event.preparation.targetId} snapshot=${snapshot.id} commit=${snapshotData.commit} error=${String(error)}`,
+        `restore source=${state.internalNavigation ?? "tree"} target=${event.preparation.targetId} kind=${snapshotData.kind} commit=${snapshotData.commit} error=${String(error)}`,
         state,
       );
       ctx.ui.notify("Workspace restore failed. Tree navigation cancelled.", "error");
@@ -1256,8 +1452,8 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         return;
       }
 
-      const after = findLastAfterSnapshot(ctx);
-      if (!hasSnapshotData(after) || !after.data.userEntryId) {
+      const after = findUndoTargetAfterSnapshot(ctx, state);
+      if (!after?.userEntryId) {
         await logLine(ctx, "undo no-op: no after snapshot", state);
         ctx.ui.notify("Nothing to undo.", "info");
         return;
@@ -1265,13 +1461,13 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
       await logLine(
         ctx,
-        `undo start currentLeaf=${ctx.sessionManager.getLeafId()} userEntry=${after.data.userEntryId} beforeSnapshot=${after.data.beforeSnapshotId}`,
+        `undo start currentLeaf=${ctx.sessionManager.getLeafId()} userEntry=${after.userEntryId} beforeCommit=${findBeforeSnapshotForUserEntry(after.userEntryId, state)?.commit}`,
         state,
       );
 
       state.internalNavigation = "undo";
       try {
-        const result = await ctx.navigateTree(after.data.userEntryId, { summarize: false });
+        const result = await ctx.navigateTree(after.userEntryId, { summarize: false });
         await logLine(ctx, `undo navigate result cancelled=${String(result.cancelled)}`, state);
         if (result.cancelled) {
           ctx.ui.notify("Undo cancelled.", "error");
@@ -1282,7 +1478,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
           await pushRedoTarget(ctx, precheck.currentLeafId, state);
         }
 
-        const userText = extractUserText(ctx.sessionManager.getEntry(after.data.userEntryId));
+        const userText = extractUserText(ctx.sessionManager.getEntry(after.userEntryId));
         if (userText) {
           ctx.ui.setEditorText(userText);
         }
