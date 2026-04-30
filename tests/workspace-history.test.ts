@@ -647,6 +647,38 @@ async function testLegacySnapshotEntriesRebuildTurnSnapshots(): Promise<void> {
   }
 }
 
+async function testBeforeCommitReusesPreviousAfterCommitWhenWorkspaceUnchanged(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "reuse-before.txt", content: "turn one\n" })]),
+      fauxAssistantMessage("created reuse-before file"),
+      fauxAssistantMessage("no workspace changes"),
+    ]);
+
+    await session.prompt("create reuse-before.txt");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "first after snapshot was not created");
+
+    await session.prompt("just reply without editing files");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 2, "second after snapshot was not created");
+
+    const turns = (await readTurnSnapshots(session, ctx.cwd)).turns;
+    assert.equal(turns.length >= 2, true, "expected at least two turn snapshots");
+
+    const first = turns.at(-2);
+    const second = turns.at(-1);
+    assert.ok(first, "first turn snapshot should exist");
+    assert.ok(second, "second turn snapshot should exist");
+    assert.equal(second!.beforeCommit, first!.afterCommit, "second before commit should reuse first after commit when workspace is unchanged");
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
 async function testPiFilesAreSnapshotManagedExceptInternalState(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -823,6 +855,7 @@ async function main(): Promise<void> {
     { name: "undo does not leak across sessions", run: testUndoDoesNotLeakAcrossSessions },
     { name: "undo works from tree-selected user node", run: testUndoWorksFromTreeSelectedUserNode },
     { name: "legacy snapshot entries rebuild turn snapshots", run: testLegacySnapshotEntriesRebuildTurnSnapshots },
+    { name: "before commit reuses previous after commit when workspace unchanged", run: testBeforeCommitReusesPreviousAfterCommitWhenWorkspaceUnchanged },
     { name: ".pi files are managed except internal state", run: testPiFilesAreSnapshotManagedExceptInternalState },
     { name: "history is stored outside workspace", run: testHistoryIsStoredOutsideWorkspace },
     { name: "undo and redo block on unsnapshotted manual changes", run: testUndoAndRedoBlockOnUnsnapshottedManualChanges },

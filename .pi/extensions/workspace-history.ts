@@ -715,7 +715,14 @@ async function readTurnSnapshotState(ctx: ExtensionContext, state?: RuntimeState
   }
 
   const paths = await getWorkspaceStoragePaths(ctx, state);
-  const snapshots = (await readJsonFile<TurnSnapshotState>(paths.turnSnapshotsFile)) ?? rebuildTurnSnapshotsFromLegacyEntries(ctx);
+  const fromFile = await readJsonFile<TurnSnapshotState>(paths.turnSnapshotsFile);
+  let snapshots = fromFile;
+  if (!snapshots) {
+    snapshots = rebuildTurnSnapshotsFromLegacyEntries(ctx);
+    if (snapshots.turns.length > 0 && !await exists(paths.turnSnapshotsFile)) {
+      await writeJsonFile(paths.turnSnapshotsFile, snapshots);
+    }
+  }
   const normalized = snapshots.turns.length > 0 ? snapshots : {
     version: 1 as const,
     turns: [],
@@ -910,6 +917,27 @@ function findUndoTargetAfterSnapshot(ctx: ExtensionContext, state?: RuntimeState
   }
 
   return findLastAfterSnapshot(ctx, state);
+}
+
+function findAfterSnapshotOnCurrentBranch(ctx: ExtensionContext, state?: RuntimeState): WorkspaceSnapshot | undefined {
+  let currentId = ctx.sessionManager.getLeafId();
+  while (currentId) {
+    const entry = ctx.sessionManager.getEntry(currentId);
+    if (!entry) {
+      return undefined;
+    }
+
+    if (!isSnapshotEntry(entry)) {
+      const resolved = findAfterSnapshotForMessageAnchor(ctx, entry, state);
+      if (resolved) {
+        return resolved;
+      }
+    }
+
+    currentId = entry.parentId ?? null;
+  }
+
+  return undefined;
 }
 
 function findTurnSnapshotByAssistantEntryId(assistantEntryId: string, state?: RuntimeState): TurnSnapshotRecord | undefined {
@@ -1245,7 +1273,13 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         state.baselineWarmupGeneration = undefined;
         await ensureBaselineSnapshot(pi, ctx, state, commit);
       } else {
-        commit = await createSnapshotCommit(pi, ctx, `before ${turnId}`, state);
+        const previousAfter = findAfterSnapshotOnCurrentBranch(ctx, state);
+        if (previousAfter && !await isWorkspaceDirtyAgainstCommit(pi, ctx, previousAfter.commit, state)) {
+          commit = previousAfter.commit;
+          await logLine(ctx, `reuse previous after commit for before snapshot turn=${turnId} commit=${commit}`, state);
+        } else {
+          commit = await createSnapshotCommit(pi, ctx, `before ${turnId}`, state);
+        }
       }
 
       state.pendingTurnId = turnId;
