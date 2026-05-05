@@ -13,7 +13,10 @@ import {
   SessionManager,
   SettingsManager,
 } from "@mariozechner/pi-coding-agent";
-import workspaceHistoryExtension, { rebuildTurnSnapshotsFromLegacyEntries } from "../.pi/extensions/workspace-history.ts";
+import workspaceHistoryExtension, {
+  rebuildTurnSnapshotsFromLegacyEntries,
+  isWindowsReservedSnapshotPath,
+} from "../.pi/extensions/workspace-history.ts";
 import {
   fauxAssistantMessage,
   fauxToolCall,
@@ -647,6 +650,13 @@ async function testLegacySnapshotEntriesRebuildTurnSnapshots(): Promise<void> {
   }
 }
 
+async function testWindowsReservedNamesAreExcludedFromSnapshotPaths(): Promise<void> {
+  assert.equal(isWindowsReservedSnapshotPath("nul"), true, "nul should be treated as a reserved Windows device path");
+  assert.equal(isWindowsReservedSnapshotPath("NUL.txt"), true, "nul with extension should be treated as reserved");
+  assert.equal(isWindowsReservedSnapshotPath("dir/aux"), true, "reserved device names in subdirectories should be excluded");
+  assert.equal(isWindowsReservedSnapshotPath("notes/null.txt"), false, "ordinary names should remain snapshot-manageable");
+}
+
 async function testBeforeCommitReusesPreviousAfterCommitWhenWorkspaceUnchanged(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -855,6 +865,7 @@ async function main(): Promise<void> {
     { name: "undo does not leak across sessions", run: testUndoDoesNotLeakAcrossSessions },
     { name: "undo works from tree-selected user node", run: testUndoWorksFromTreeSelectedUserNode },
     { name: "legacy snapshot entries rebuild turn snapshots", run: testLegacySnapshotEntriesRebuildTurnSnapshots },
+    { name: "windows reserved names are excluded from snapshot paths", run: testWindowsReservedNamesAreExcludedFromSnapshotPaths },
     { name: "before commit reuses previous after commit when workspace unchanged", run: testBeforeCommitReusesPreviousAfterCommitWhenWorkspaceUnchanged },
     { name: ".pi files are managed except internal state", run: testPiFilesAreSnapshotManagedExceptInternalState },
     { name: "history is stored outside workspace", run: testHistoryIsStoredOutsideWorkspace },

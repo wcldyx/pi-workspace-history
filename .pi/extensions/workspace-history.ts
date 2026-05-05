@@ -144,6 +144,31 @@ const DEFAULT_EXCLUDES = [
   ".env.*",
 ];
 
+const WINDOWS_RESERVED_BASENAMES = new Set([
+  "con",
+  "prn",
+  "aux",
+  "nul",
+  "com1",
+  "com2",
+  "com3",
+  "com4",
+  "com5",
+  "com6",
+  "com7",
+  "com8",
+  "com9",
+  "lpt1",
+  "lpt2",
+  "lpt3",
+  "lpt4",
+  "lpt5",
+  "lpt6",
+  "lpt7",
+  "lpt8",
+  "lpt9",
+]);
+
 async function exists(filePath: string): Promise<boolean> {
   try {
     await access(filePath);
@@ -368,6 +393,25 @@ function normalizeSnapshotPath(relativePath: string): string {
   return relativePath.replace(/\\/g, "/").replace(/^\.\//, "");
 }
 
+export function isWindowsReservedSnapshotPath(relativePath: string): boolean {
+  const normalized = normalizeSnapshotPath(relativePath);
+  return normalized
+    .split("/")
+    .some((segment) => {
+      const trimmed = segment.trim().replace(/[. ]+$/g, "");
+      const base = trimmed.split(".", 1)[0]?.toLowerCase() ?? "";
+      return WINDOWS_RESERVED_BASENAMES.has(base);
+    });
+}
+
+function getWindowsReservedIgnorePatterns(): string[] {
+  const patterns: string[] = [];
+  for (const base of WINDOWS_RESERVED_BASENAMES) {
+    patterns.push(base, `${base}.*`);
+  }
+  return patterns;
+}
+
 async function getSnapshotIgnoreMatcher(ctx: ExtensionContext, state?: RuntimeState): Promise<Ignore> {
   const gitignorePath = path.join(ctx.cwd, ".gitignore");
   const gitignoreSource = await readFile(gitignorePath, "utf8").catch(() => "");
@@ -378,6 +422,7 @@ async function getSnapshotIgnoreMatcher(ctx: ExtensionContext, state?: RuntimeSt
 
   const matcher = ignore();
   matcher.add(DEFAULT_EXCLUDES);
+  matcher.add(getWindowsReservedIgnorePatterns());
   if (gitignoreSource.trim().length > 0) {
     matcher.add(gitignoreSource);
   }
@@ -396,7 +441,7 @@ async function filterSnapshotPaths(
   state?: RuntimeState,
 ): Promise<string[]> {
   const matcher = await getSnapshotIgnoreMatcher(ctx, state);
-  return relativePaths.filter((relativePath) => !matcher.ignores(normalizeSnapshotPath(relativePath)));
+  return relativePaths.filter((relativePath) => !matcher.ignores(normalizeSnapshotPath(relativePath)) && !isWindowsReservedSnapshotPath(relativePath));
 }
 
 async function listExcludedWorkspacePaths(ctx: ExtensionContext, state?: RuntimeState): Promise<string[]> {
@@ -409,7 +454,7 @@ async function listExcludedWorkspacePaths(ctx: ExtensionContext, state?: Runtime
 
     for (const entry of entries) {
       const relativePath = relativeDir.length > 0 ? path.join(relativeDir, entry.name) : entry.name;
-      if (matcher.ignores(normalizeSnapshotPath(relativePath))) {
+      if (matcher.ignores(normalizeSnapshotPath(relativePath)) || isWindowsReservedSnapshotPath(relativePath)) {
         excludedPaths.push(relativePath);
         continue;
       }
@@ -447,6 +492,7 @@ async function syncShadowRepoExclude(ctx: ExtensionContext, state?: RuntimeState
   const excludePath = path.join(paths.shadowGitDir, "info", "exclude");
   const excludeSource = [
     ...DEFAULT_EXCLUDES.map(normalizeSnapshotPath),
+    ...getWindowsReservedIgnorePatterns(),
     gitignoreSource.trim().length > 0 ? gitignoreSource.trimEnd() : "",
   ]
     .filter((part) => part.length > 0)
@@ -552,8 +598,22 @@ async function listUntrackedPaths(pi: ExtensionAPI, ctx: ExtensionContext, state
 }
 
 async function stageSnapshotFiles(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
+  const currentTracked = await listTrackedPaths(pi, ctx, state);
+  const currentUntracked = await listUntrackedPaths(pi, ctx, state);
+  const currentManaged = await filterSnapshotPaths(ctx, [...new Set([...currentTracked, ...currentUntracked])], state);
+  if (currentManaged.length > 0) {
+    const pathspecFile = path.join((await getWorkspaceStoragePaths(ctx, state)).sessionRoot, `stage-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
+    await writeFile(pathspecFile, Buffer.from(currentManaged.join("\0") + "\0", "utf8"));
+    try {
+      await execGit(pi, ctx, [
+        ...(await gitArgs(ctx, state, "add", "-A", "--pathspec-from-file", pathspecFile, "--pathspec-file-nul")),
+      ]);
+    } finally {
+      await unlink(pathspecFile).catch(() => undefined);
+    }
+  }
+
   const excludedPaths = await listExcludedWorkspacePaths(ctx, state);
-  await execGit(pi, ctx, await gitArgs(ctx, state, "add", "-A", "--", "."));
   await removeExcludedPathsFromShadowIndex(pi, ctx, excludedPaths, state);
 }
 
