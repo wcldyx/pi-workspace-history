@@ -151,6 +151,20 @@ Settings:
 - `workspaceHistory.maxWorkspaces`
   - Keep only the most recently used workspaces globally
   - Default: `10`
+- `workspaceHistory.enabled`
+  - `auto` (default) disables the plugin outside project-like directories
+  - `true` forces it on
+  - `false` disables it completely
+- `workspaceHistory.allowHomeDirectory`
+  - Allow enabling in the user home directory
+  - Default: `false`
+- `workspaceHistory.requireProjectMarker`
+  - Require a project marker such as `.git` or `package.json`
+  - Default: `true`
+- `workspaceHistory.maxScanFiles` / `workspaceHistory.maxScanDirs` / `workspaceHistory.maxScanMs`
+  - Safety budget for workspace scanning
+- `workspaceHistory.gitTimeoutMs`
+  - Timeout for internal git operations
 
 ## Installation And Usage
 
@@ -228,3 +242,4 @@ Notes:
 - History is isolated from the user's project `.git` history
 - Old workspace-local `.pi/workspace-history/` state is not migrated automatically
 - Cleanup is LRU-style based on recent use
+- In `auto` mode, the plugin disables itself in broad directories like the user home folder to avoid expensive scans and startup stalls

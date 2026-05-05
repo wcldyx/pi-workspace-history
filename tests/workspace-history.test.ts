@@ -45,7 +45,7 @@ type TurnSnapshotState = {
   }>;
 };
 
-async function createContextForWorkspace(rootDir: string, cwd: string): Promise<TestContext> {
+async function createContextForWorkspace(rootDir: string, cwd: string, withProjectMarker = true): Promise<TestContext> {
   const authStorage = AuthStorage.inMemory();
   const modelRegistry = ModelRegistry.inMemory(authStorage);
   const settingsManager = SettingsManager.inMemory({
@@ -100,6 +100,10 @@ async function createContextForWorkspace(rootDir: string, cwd: string): Promise<
   });
   await resourceLoader.reload();
 
+  if (withProjectMarker) {
+    await writeFile(path.join(cwd, "package.json"), JSON.stringify({ name: "timemachine-test-workspace" }, null, 2) + "\n", "utf8");
+  }
+
   return {
     rootDir,
     cwd,
@@ -115,7 +119,14 @@ async function createContext(): Promise<TestContext> {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "pi-timemachine-test-"));
   const cwd = path.join(rootDir, "workspace");
   await mkdir(cwd, { recursive: true });
-  return createContextForWorkspace(rootDir, cwd);
+  return createContextForWorkspace(rootDir, cwd, true);
+}
+
+async function createNonProjectContext(): Promise<TestContext> {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "pi-timemachine-test-"));
+  const cwd = path.join(rootDir, "workspace");
+  await mkdir(cwd, { recursive: true });
+  return createContextForWorkspace(rootDir, cwd, false);
 }
 
 async function disposeContext(ctx: TestContext): Promise<void> {
@@ -555,6 +566,35 @@ async function testUndoDoesNotLeakAcrossSessions(): Promise<void> {
   }
 }
 
+async function testNonProjectWorkspaceDisablesExtension(): Promise<void> {
+  const ctx = await createNonProjectContext();
+  try {
+    const session = await createSession(ctx);
+
+    await waitFor(async () => (await countSnapshots(session, ctx.cwd)) === 0, "non-project workspace should not create snapshots");
+
+    const nav = await session.navigateTree(session.sessionManager.getLeafId() ?? "", { summarize: false }).catch(() => ({ cancelled: false }));
+    assert.equal(nav.cancelled, false, "tree navigation should not be cancelled when workspace history is disabled");
+
+    await session.prompt("/undo");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await waitFor(async () => (await countSnapshots(session, ctx.cwd)) === 0, "non-project workspace should remain disabled for commands");
+
+    await writeFile(path.join(ctx.cwd, "package.json"), JSON.stringify({ name: "timemachine-test-workspace" }, null, 2) + "\n", "utf8");
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "activated.txt", content: "activated\n" })]),
+      fauxAssistantMessage("activated"),
+    ]);
+
+    await session.prompt("create activated.txt");
+    await waitFor(async () => (await countSnapshots(session, ctx.cwd, "after")) >= 1, "workspace history should re-enable after adding a project marker");
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
 async function testUndoWorksFromTreeSelectedUserNode(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -857,6 +897,7 @@ async function testRestoreFailureDoesNotDeleteCurrentWorkspace(): Promise<void> 
 async function main(): Promise<void> {
   const tests: Array<{ name: string; run: () => Promise<void> }> = [
     { name: "session start does not create baseline eagerly", run: testSessionStartDoesNotCreateBaselineEagerly },
+    { name: "non-project workspace disables extension", run: testNonProjectWorkspaceDisablesExtension },
     { name: "undo/redo restores workspace", run: testUndoRedo },
     { name: "undo preserves manual changes before next turn", run: testManualChangesProtectedAcrossUndo },
     { name: "repeated undo walks back turn by turn", run: testRepeatedUndo },

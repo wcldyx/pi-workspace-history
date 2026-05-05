@@ -150,6 +150,20 @@
 - `workspaceHistory.maxWorkspaces`
   - 全局最多保留最近使用的工作区数
   - 默认：`10`
+- `workspaceHistory.enabled`
+  - `auto`（默认）会在非项目目录自动禁用插件
+  - `true` 强制启用
+  - `false` 完全禁用
+- `workspaceHistory.allowHomeDirectory`
+  - 是否允许在用户 home 目录启用
+  - 默认：`false`
+- `workspaceHistory.requireProjectMarker`
+  - 是否要求存在 `.git`、`package.json` 等项目标记
+  - 默认：`true`
+- `workspaceHistory.maxScanFiles` / `workspaceHistory.maxScanDirs` / `workspaceHistory.maxScanMs`
+  - 工作区扫描的安全预算
+- `workspaceHistory.gitTimeoutMs`
+  - 插件内部 git 操作超时时间
 
 ## 安装与使用
 
@@ -227,3 +241,4 @@ npm run typecheck
 - shadow git 与用户项目自身的 `.git` 历史隔离
 - 旧的工作区内 `.pi/workspace-history/` 状态不会自动迁移
 - 清理策略基于最近使用时间（LRU 风格）
+- 在 `auto` 模式下，插件会在像用户 home 目录这样的宽泛目录里自动禁用，避免启动扫描过大导致卡顿
