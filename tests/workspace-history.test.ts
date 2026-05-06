@@ -782,6 +782,34 @@ async function testHistoryIsStoredOutsideWorkspace(): Promise<void> {
   }
 }
 
+async function testUnicodePathsSurviveUndoRedo(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    const relativePath = "src/后台/views/系统设置/工程设置/微信设置/油品设置/utils.ts";
+    const filePath = path.join(ctx.cwd, ...relativePath.split("/"));
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: relativePath, content: "export const value = 1;\n" })]),
+      fauxAssistantMessage("created unicode path file"),
+    ]);
+
+    await session.prompt("create unicode path file");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "unicode path after snapshot was not created");
+    await waitForText(filePath, "export const value = 1;\n", "unicode path file should be created");
+
+    await session.prompt("/undo");
+    await waitForExists(filePath, false, "unicode path file should be removed after /undo");
+
+    await session.prompt("/redo");
+    await waitForText(filePath, "export const value = 1;\n", "unicode path file should be restored after /redo");
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
 async function testUndoAndRedoBlockOnUnsnapshottedManualChanges(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -910,6 +938,7 @@ async function main(): Promise<void> {
     { name: "before commit reuses previous after commit when workspace unchanged", run: testBeforeCommitReusesPreviousAfterCommitWhenWorkspaceUnchanged },
     { name: ".pi files are managed except internal state", run: testPiFilesAreSnapshotManagedExceptInternalState },
     { name: "history is stored outside workspace", run: testHistoryIsStoredOutsideWorkspace },
+    { name: "unicode paths survive undo and redo", run: testUnicodePathsSurviveUndoRedo },
     { name: "undo and redo block on unsnapshotted manual changes", run: testUndoAndRedoBlockOnUnsnapshottedManualChanges },
     { name: ".gitignore stops managing ignored paths", run: testGitignoreStopsManagingIgnoredPaths },
     { name: "restore failure does not delete current workspace", run: testRestoreFailureDoesNotDeleteCurrentWorkspace },
