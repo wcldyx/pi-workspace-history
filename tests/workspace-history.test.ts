@@ -332,7 +332,7 @@ async function testSessionStartDoesNotCreateBaselineEagerly(): Promise<void> {
 
     assert.equal(await countSnapshots(session, ctx.cwd), 0, "session start should not create baseline eagerly");
     await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.equal(await countSnapshots(session, ctx.cwd), 0, "idle baseline warmup should not append snapshot entries before the first turn");
+    assert.equal(await countSnapshots(session, ctx.cwd), 0, "idle baseline warmup should not append session entries before the first turn");
 
     ctx.provider.setResponses([
       fauxAssistantMessage([fauxToolCall("write", { path: "lazy.txt", content: "lazy baseline\n" })]),
@@ -782,6 +782,75 @@ async function testHistoryIsStoredOutsideWorkspace(): Promise<void> {
   }
 }
 
+async function testIdleWarmupIsReusedByFirstTurn(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+
+    await waitFor(async () => {
+      const turns = await readTurnSnapshots(session, ctx.cwd);
+      return turns.turns.length === 0 && (await countSnapshots(session, ctx.cwd, "baseline")) === 0;
+    }, "idle warmup should not append session entries", 4000);
+
+    await new Promise((resolve) => setTimeout(resolve, 1800));
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage("no workspace changes after warmup"),
+    ]);
+
+    await session.prompt("reply without editing files");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "after snapshot was not created after idle warmup");
+
+    const turns = (await readTurnSnapshots(session, ctx.cwd)).turns;
+    const first = turns.at(-1);
+    assert.ok(first, "first turn snapshot should exist after idle warmup");
+    assert.equal(first!.beforeCommit, first!.afterCommit, "warm first turn with no edits should reuse the warmed baseline commit");
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
+  const ctx1 = await createContext();
+  try {
+    const session1 = await createSession(ctx1);
+
+    ctx1.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "reuse-shadow.txt", content: "base\n" })]),
+      fauxAssistantMessage("created reusable shadow state"),
+    ]);
+
+    await session1.prompt("create reusable shadow state");
+    await waitFor(async () => await countSnapshots(session1, ctx1.cwd, "after") >= 1, "first session after snapshot was not created");
+    session1.dispose();
+
+    const ctx2 = await createContextForWorkspace(ctx1.rootDir, ctx1.cwd);
+    const session2 = await createSession(ctx2);
+    const workspaceHash = createHash("sha256").update(path.normalize(ctx1.cwd)).digest("hex").slice(0, 24);
+    const gitDir = path.join(
+      getAgentDir(),
+      "state",
+      "workspace-history",
+      "workspaces",
+      workspaceHash,
+      "sessions",
+      session2.sessionManager.getSessionId(),
+      "repo.git",
+    );
+
+    await waitFor(async () => await pathExists(path.join(gitDir, "objects")), "second session shadow git repo should exist");
+    const head = await readFile(path.join(gitDir, "HEAD"), "utf8");
+    assert.match(head, /refs\/heads|[0-9a-f]{40}/, "second session should have a cloned shadow repo with HEAD");
+
+    session2.dispose();
+    ctx2.provider.unregister();
+  } finally {
+    await disposeContext(ctx1);
+  }
+}
+
 async function testUnicodePathsSurviveUndoRedo(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -925,6 +994,7 @@ async function testRestoreFailureDoesNotDeleteCurrentWorkspace(): Promise<void> 
 async function main(): Promise<void> {
   const tests: Array<{ name: string; run: () => Promise<void> }> = [
     { name: "session start does not create baseline eagerly", run: testSessionStartDoesNotCreateBaselineEagerly },
+    { name: "idle warmup is reused by first turn", run: testIdleWarmupIsReusedByFirstTurn },
     { name: "non-project workspace disables extension", run: testNonProjectWorkspaceDisablesExtension },
     { name: "undo/redo restores workspace", run: testUndoRedo },
     { name: "undo preserves manual changes before next turn", run: testManualChangesProtectedAcrossUndo },
@@ -938,6 +1008,7 @@ async function main(): Promise<void> {
     { name: "before commit reuses previous after commit when workspace unchanged", run: testBeforeCommitReusesPreviousAfterCommitWhenWorkspaceUnchanged },
     { name: ".pi files are managed except internal state", run: testPiFilesAreSnapshotManagedExceptInternalState },
     { name: "history is stored outside workspace", run: testHistoryIsStoredOutsideWorkspace },
+    { name: "new session reuses workspace shadow repo", run: testNewSessionReusesWorkspaceShadowRepo },
     { name: "unicode paths survive undo and redo", run: testUnicodePathsSurviveUndoRedo },
     { name: "undo and redo block on unsnapshotted manual changes", run: testUndoAndRedoBlockOnUnsnapshottedManualChanges },
     { name: ".gitignore stops managing ignored paths", run: testGitignoreStopsManagingIgnoredPaths },
