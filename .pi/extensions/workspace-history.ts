@@ -35,6 +35,7 @@ const DEFAULT_MAX_SCAN_MS = 5_000;
 const DEFAULT_GIT_TIMEOUT_MS = 60_000;
 const SHADOW_REPO_LOCK_WAIT_MS = 5_000;
 const SHADOW_REPO_LOCK_STALE_MS = 15_000;
+const WORKSPACE_HISTORY_LOG_ENV = "PI_WORKSPACE_HISTORY_LOG";
 const PROJECT_MARKER_FILES = [
   ".git",
   "package.json",
@@ -98,9 +99,12 @@ interface RuntimeState {
   cachedSettings?: WorkspaceHistorySettings;
   cachedPaths?: WorkspaceStoragePaths;
   cleanupPromise?: Promise<void>;
+  reusableRepoUpdatePromise?: Promise<void>;
   lastCleanupAt?: number;
+  lastKnownShadowHead?: string;
   initialSnapshotCommit?: string;
   warmedBaselineCommit?: string;
+  pendingBeforeSnapshotPrompt?: string;
   baselineWarmupTimer?: ReturnType<typeof setTimeout>;
   baselineWarmupPromise?: Promise<void>;
   baselineWarmupGeneration?: number;
@@ -145,6 +149,7 @@ interface WorkspaceStoragePaths {
   workspaceHash: string;
   workspaceRoot: string;
   sessionsRoot: string;
+  reusableGitDir: string;
   sessionRoot: string;
   shadowGitDir: string;
   redoFile: string;
@@ -426,6 +431,7 @@ async function buildWorkspaceStoragePaths(ctx: ExtensionContext, settings: Works
     workspaceHash,
     workspaceRoot,
     sessionsRoot: path.join(workspaceRoot, "sessions"),
+    reusableGitDir: path.join(workspaceRoot, "repo.git"),
     sessionRoot,
     shadowGitDir: path.join(sessionRoot, "repo.git"),
     redoFile: path.join(sessionRoot, "redo.json"),
@@ -538,9 +544,14 @@ async function listSubdirectories(dirPath: string): Promise<string[]> {
   }
 }
 
-async function findReusableShadowGitDir(ctx: ExtensionContext, state?: RuntimeState): Promise<string | undefined> {
+async function findReusableShadowGitDir(ctx: ExtensionContext, state?: RuntimeState): Promise<{ gitDir: string; shared: boolean } | undefined> {
   const paths = await ensureStorageDirs(ctx, state);
   const currentSessionId = ctx.sessionManager.getSessionId();
+  if (await exists(paths.reusableGitDir) && !await exists(path.join(paths.reusableGitDir, "index.lock"))) {
+    await logLine(ctx, `reuse workspace repo candidate gitDir=${paths.reusableGitDir}`, state);
+    return { gitDir: paths.reusableGitDir, shared: true };
+  }
+
   const sessionIds = await listSubdirectories(paths.sessionsRoot);
   const candidates = await Promise.all(sessionIds
     .filter((sessionId) => sessionId !== currentSessionId)
@@ -558,10 +569,41 @@ async function findReusableShadowGitDir(ctx: ExtensionContext, state?: RuntimeSt
     if (!await exists(candidate.gitDir) || await exists(path.join(candidate.gitDir, "index.lock"))) {
       continue;
     }
-    return candidate.gitDir;
+    await logLine(ctx, `reuse session repo candidate gitDir=${candidate.gitDir}`, state);
+    return { gitDir: candidate.gitDir, shared: false };
   }
 
+  await logLine(ctx, `reuse repo unavailable workspaceGitDir=${paths.reusableGitDir} sessionCandidates=${candidates.length}`, state);
   return undefined;
+}
+
+async function updateReusableShadowRepo(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
+  const paths = await ensureStorageDirs(ctx, state);
+  if (!await exists(paths.shadowGitDir) || await exists(path.join(paths.shadowGitDir, "index.lock"))) {
+    return;
+  }
+
+  if (!await exists(paths.reusableGitDir)) {
+    await execGit(pi, ctx, ["clone", "--bare", paths.shadowGitDir, paths.reusableGitDir]);
+    await logLine(ctx, `update reusable repo cloned from=${paths.shadowGitDir} to=${paths.reusableGitDir}`, state);
+    return;
+  }
+
+  await execGit(pi, ctx, ["--git-dir", paths.reusableGitDir, "fetch", paths.shadowGitDir, "+refs/*:refs/*"]);
+  await logLine(ctx, `update reusable repo fetched from=${paths.shadowGitDir} to=${paths.reusableGitDir}`, state);
+}
+
+function scheduleReusableShadowRepoUpdate(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): void {
+  if (!state || state.reusableRepoUpdatePromise) {
+    return;
+  }
+  state.reusableRepoUpdatePromise = Promise.resolve().then(async () => {
+    await updateReusableShadowRepo(pi, ctx, state);
+  }).catch((error) => {
+    void logLine(ctx, `update reusable repo failed error=${String(error)}`, state);
+  }).finally(() => {
+    state.reusableRepoUpdatePromise = undefined;
+  });
 }
 
 async function cleanupWorkspaceHistory(ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
@@ -710,12 +752,21 @@ function parseNullSeparatedPaths(raw: string): string[] {
 }
 
 async function logLine(ctx: ExtensionContext, line: string, state?: RuntimeState): Promise<void> {
+  if (!isWorkspaceHistoryLoggingEnabled()) {
+    return;
+  }
+
   const paths = await ensureStorageDirs(ctx, state);
   await appendFile(paths.logFile, `[${new Date().toISOString()}] ${line}\n`, "utf8");
 }
 
 function elapsedMs(startedAt: number): number {
   return Date.now() - startedAt;
+}
+
+function isWorkspaceHistoryLoggingEnabled(): boolean {
+  const value = process.env[WORKSPACE_HISTORY_LOG_ENV]?.trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes" || value === "on";
 }
 
 function summarizeGitArgs(args: string[]): string {
@@ -911,15 +962,15 @@ async function hasWorkspaceChanges(pi: ExtensionAPI, ctx: ExtensionContext, stat
   return changed;
 }
 
-async function hasHeadCommit(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<boolean> {
-  await assertWorkspaceHistoryEnabled(ctx, state, "hasHeadCommit");
+async function getHeadCommit(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<string | undefined> {
+  await assertWorkspaceHistoryEnabled(ctx, state, "getHeadCommit");
   await ensureShadowRepo(pi, ctx, state);
   const result = await withTimeout(
     pi.exec("git", await gitArgs(ctx, state, "rev-parse", "--verify", "HEAD"), { cwd: ctx.cwd }),
     await getGitTimeoutMs(ctx, state),
     "git rev-parse",
   );
-  return result.code === 0;
+  return result.code === 0 ? result.stdout.trim() : undefined;
 }
 
 async function ensureShadowRepo(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
@@ -934,9 +985,9 @@ async function ensureShadowRepo(pi: ExtensionAPI, ctx: ExtensionContext, state?:
 
   const reusableGitDir = await findReusableShadowGitDir(ctx, state);
   if (reusableGitDir) {
-    await execGit(pi, ctx, ["clone", "--bare", reusableGitDir, paths.shadowGitDir]);
-    await execGit(pi, ctx, await gitArgs(ctx, state, "reset", "--mixed", "HEAD"));
-    await logLine(ctx, `clone repo session=${ctx.sessionManager.getSessionId()} from=${reusableGitDir} gitDir=${paths.shadowGitDir}`, state);
+    await execGit(pi, ctx, ["clone", ...(reusableGitDir.shared ? ["--shared"] : []), "--bare", reusableGitDir.gitDir, paths.shadowGitDir]);
+    await execGit(pi, ctx, await gitArgs(ctx, state, "read-tree", "HEAD"));
+    await logLine(ctx, `clone repo session=${ctx.sessionManager.getSessionId()} shared=${String(reusableGitDir.shared)} from=${reusableGitDir.gitDir} gitDir=${paths.shadowGitDir}`, state);
   } else {
     await execGit(pi, ctx, ["init", "--bare", paths.shadowGitDir]);
     await logLine(ctx, `init repo session=${ctx.sessionManager.getSessionId()} gitDir=${paths.shadowGitDir}`, state);
@@ -950,24 +1001,36 @@ async function createSnapshotCommit(
   ctx: ExtensionContext,
   label: string,
   state?: RuntimeState,
+  assumeDirty = false,
 ): Promise<string> {
   return runSerializedSnapshotWrite(state, async () => {
     const startedAt = Date.now();
-    await logLine(ctx, `snapshot commit start label=${label}`, state);
+    await logLine(ctx, `snapshot commit start label=${label} assumeDirty=${String(assumeDirty)}`, state);
     await assertWorkspaceHistoryEnabled(ctx, state, "createSnapshotCommit");
     await ensureShadowRepo(pi, ctx, state);
-    if (await hasHeadCommit(pi, ctx, state) && !await hasWorkspaceChanges(pi, ctx, state)) {
-      await touchWorkspaceAndSessionMeta(ctx, state);
-      scheduleCleanup(ctx, state);
-      const commit = await execGit(pi, ctx, await gitArgs(ctx, state, "rev-parse", "HEAD"));
-      await logLine(ctx, `snapshot commit reused label=${label} commit=${commit} ${elapsedMs(startedAt)}ms`, state);
-      return commit;
+    if (!assumeDirty) {
+      const currentHead = state?.lastKnownShadowHead ?? await getHeadCommit(pi, ctx, state);
+      if (state && currentHead) {
+        state.lastKnownShadowHead = currentHead;
+      }
+      if (currentHead && !await hasWorkspaceChanges(pi, ctx, state)) {
+        await touchWorkspaceAndSessionMeta(ctx, state);
+        scheduleCleanup(ctx, state);
+        await logLine(ctx, `snapshot commit reused label=${label} commit=${currentHead} ${elapsedMs(startedAt)}ms`, state);
+        return currentHead;
+      }
     }
     await stageSnapshotFiles(pi, ctx, state);
     await execGit(pi, ctx, [...(await gitCommitArgs(ctx, state, "commit", "--allow-empty", "-m", `[workspace-history] ${label}`))]);
     await touchWorkspaceAndSessionMeta(ctx, state);
+    if (!label.startsWith("after ")) {
+      scheduleReusableShadowRepoUpdate(pi, ctx, state);
+    }
     scheduleCleanup(ctx, state);
     const commit = await execGit(pi, ctx, await gitArgs(ctx, state, "rev-parse", "HEAD"));
+    if (state) {
+      state.lastKnownShadowHead = commit;
+    }
     await logLine(ctx, `snapshot commit created label=${label} commit=${commit} ${elapsedMs(startedAt)}ms`, state);
     return commit;
   });
@@ -993,6 +1056,9 @@ async function restoreSnapshotCommit(pi: ExtensionAPI, ctx: ExtensionContext, co
     }
 
     await execGit(pi, ctx, await gitArgs(ctx, state, "reset", "--hard", commit));
+    if (state) {
+      state.lastKnownShadowHead = commit;
+    }
     await execGit(pi, ctx, await gitArgs(ctx, state, "clean", "-fd", ...protectedPaths.flatMap((relativePath) => ["-e", normalizeSnapshotPath(relativePath)]), "--", "."));
 
     for (const relativePath of protectedPaths) {
@@ -1440,8 +1506,21 @@ async function isWorkspaceDirtyAgainstCommit(
   commit: string,
   state?: RuntimeState,
 ): Promise<boolean> {
+  const startedAt = Date.now();
   await assertWorkspaceHistoryEnabled(ctx, state, "isWorkspaceDirtyAgainstCommit");
   await ensureShadowRepo(pi, ctx, state);
+
+  const headCommit = state?.lastKnownShadowHead === commit
+    ? state.lastKnownShadowHead
+    : await getHeadCommit(pi, ctx, state);
+  if (state && headCommit) {
+    state.lastKnownShadowHead = headCommit;
+  }
+  if (headCommit === commit) {
+    const changed = await hasWorkspaceChanges(pi, ctx, state);
+    await logLine(ctx, `dirty against commit via status ${elapsedMs(startedAt)}ms commit=${commit} changed=${String(changed)}`, state);
+    return changed;
+  }
 
   const diffResult = await withTimeout(
     pi.exec(
@@ -1475,7 +1554,9 @@ async function isWorkspaceDirtyAgainstCommit(
     throw new Error(untrackedResult.stderr || untrackedResult.stdout || "git ls-files failed");
   }
 
-  return untrackedResult.stdout.trim().length > 0;
+  const changed = untrackedResult.stdout.trim().length > 0;
+  await logLine(ctx, `dirty against commit via diff ${elapsedMs(startedAt)}ms commit=${commit} changed=${String(changed)}`, state);
+  return changed;
 }
 
 async function isWorkspaceDirtyAgainstSnapshot(
@@ -1676,7 +1757,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       return;
     }
 
-    if (state.beforeSnapshotPromise) {
+    if (state.beforeSnapshotPromise && state.pendingBeforeSnapshotPrompt === promptText) {
       await state.beforeSnapshotPromise;
       return;
     }
@@ -1717,9 +1798,14 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       } else {
         await logLine(ctx, `before snapshot start turn=${turnId} first=false prompt=${String(promptText ?? "")}`, state);
         const previousAfter = findAfterSnapshotOnCurrentBranch(ctx, state);
-        if (previousAfter && !await isWorkspaceDirtyAgainstCommit(pi, ctx, previousAfter.commit, state)) {
-          commit = previousAfter.commit;
-          await logLine(ctx, `reuse previous after commit for before snapshot turn=${turnId} commit=${commit}`, state);
+        if (previousAfter) {
+          const changedSincePreviousAfter = await isWorkspaceDirtyAgainstCommit(pi, ctx, previousAfter.commit, state);
+          if (!changedSincePreviousAfter) {
+            commit = previousAfter.commit;
+            await logLine(ctx, `reuse previous after commit for before snapshot turn=${turnId} commit=${commit}`, state);
+          } else {
+            commit = await createSnapshotCommit(pi, ctx, `before ${turnId}`, state, true);
+          }
         } else {
           commit = await createSnapshotCommit(pi, ctx, `before ${turnId}`, state);
         }
@@ -1736,12 +1822,14 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     })();
 
     state.beforeSnapshotPromise = beforeSnapshotPromise;
+    state.pendingBeforeSnapshotPrompt = promptText;
 
     try {
       await beforeSnapshotPromise;
     } finally {
       if (state.beforeSnapshotPromise === beforeSnapshotPromise) {
         state.beforeSnapshotPromise = undefined;
+        state.pendingBeforeSnapshotPrompt = undefined;
       }
     }
   }
@@ -1753,6 +1841,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.pendingTurnId = undefined;
     state.pendingBeforeCommit = undefined;
     state.pendingPromptText = undefined;
+    state.pendingBeforeSnapshotPrompt = undefined;
     state.internalNavigation = undefined;
     state.initialSnapshotCommit = undefined;
     state.warmedBaselineCommit = undefined;
@@ -1762,6 +1851,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.baselineWarmupInProgress = false;
     state.snapshotWritePromise = undefined;
     state.beforeSnapshotPromise = undefined;
+    state.reusableRepoUpdatePromise = undefined;
     state.disabledNoticeReason = undefined;
     state.initializationNoticeShown = false;
 
@@ -1776,6 +1866,27 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     scheduleCleanup(ctx, state);
     scheduleBaselineWarmup(ctx, state);
     await logLine(ctx, `session_start done ${elapsedMs(startedAt)}ms session=${ctx.sessionManager.getSessionId()}`, state);
+  });
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    const state = getState(ctx);
+    await state.reusableRepoUpdatePromise?.catch(() => undefined);
+  });
+
+  pi.on("input", async (event, ctx) => {
+    const state = getState(ctx);
+    if (event.source === "extension" || isSlashCommandPrompt(event.text)) {
+      return { action: "continue" };
+    }
+    if (!await ensureWorkspaceHistoryAvailable(ctx, state, "input")) {
+      return { action: "continue" };
+    }
+    state.pendingPromptText = event.text;
+    void ensureBeforeSnapshotForTurn(ctx, state, event.text).catch((error) => {
+      void logLine(ctx, `input before snapshot failed error=${String(error)}`, state);
+    });
+    await logLine(ctx, "input before snapshot scheduled", state);
+    return { action: "continue" };
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
@@ -1837,8 +1948,9 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       }
 
       let commit = state.pendingBeforeCommit;
-      if (!commit || await isWorkspaceDirtyAgainstCommit(pi, ctx, commit, state)) {
-        commit = await createSnapshotCommit(pi, ctx, `after ${state.pendingTurnId}`, state);
+      const needsAfterSnapshot = !commit || await isWorkspaceDirtyAgainstCommit(pi, ctx, commit, state);
+      if (needsAfterSnapshot) {
+        commit = await createSnapshotCommit(pi, ctx, `after ${state.pendingTurnId}`, state, true);
       } else {
         await logLine(ctx, `reuse before commit for after snapshot turn=${state.pendingTurnId} commit=${commit}`, state);
       }

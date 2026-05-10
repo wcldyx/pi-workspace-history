@@ -1,6 +1,6 @@
 {
   "name": "pi-workspace-history",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "Real workspace undo/redo for Pi. Bring Claude Code style /rewind and OpenCode /undo safety to @mariozechner/pi-coding-agent.",
   "author": "wcldyx",

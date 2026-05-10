@@ -107,6 +107,12 @@ async function createContextForWorkspace(rootDir: string, cwd: string, withProje
   if (withProjectMarker) {
     await writeFile(path.join(cwd, "package.json"), JSON.stringify({ name: "timemachine-test-workspace" }, null, 2) + "\n", "utf8");
   }
+  await mkdir(path.join(cwd, ".pi"), { recursive: true });
+  await writeFile(
+    path.join(cwd, ".pi", "settings.json"),
+    JSON.stringify({ workspaceHistory: { storageDir: getWorkspaceHistoryStateDir(rootDir) } }, null, 2) + "\n",
+    "utf8",
+  );
 
   return {
     rootDir,
@@ -217,6 +223,10 @@ function normalizeEol(text: string): string {
   return text.replace(/\r\n/g, "\n");
 }
 
+function getWorkspaceHistoryStateDir(rootDir: string): string {
+  return path.join(rootDir, "workspace-history-state");
+}
+
 async function waitFor(condition: () => boolean | Promise<boolean>, message: string, timeoutMs = 5000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -245,9 +255,7 @@ async function waitForText(filePath: string, expected: string, message: string):
 function getTurnSnapshotFile(session: Awaited<ReturnType<typeof createSession>>, cwd: string): string {
   const workspaceHash = createHash("sha256").update(path.normalize(cwd)).digest("hex").slice(0, 24);
   return path.join(
-    getAgentDir(),
-    "state",
-    "workspace-history",
+    getWorkspaceHistoryStateDir(path.dirname(cwd)),
     "workspaces",
     workspaceHash,
     "sessions",
@@ -776,7 +784,7 @@ async function testHistoryIsStoredOutsideWorkspace(): Promise<void> {
     const legacyDir = path.join(ctx.cwd, ".pi", "workspace-history");
     assert.equal(await pathExists(legacyDir), false, "legacy workspace history dir should not be created in workspace");
 
-    const externalRoot = path.join(getAgentDir(), "state", "workspace-history");
+    const externalRoot = getWorkspaceHistoryStateDir(ctx.rootDir);
     const workspacesDir = path.join(externalRoot, "workspaces");
     assert.equal(await pathExists(workspacesDir), true, "external workspace history dir should exist");
 
@@ -834,9 +842,7 @@ async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
     const session2 = await createSession(ctx2);
     const workspaceHash = createHash("sha256").update(path.normalize(ctx1.cwd)).digest("hex").slice(0, 24);
     const gitDir = path.join(
-      getAgentDir(),
-      "state",
-      "workspace-history",
+      getWorkspaceHistoryStateDir(ctx1.rootDir),
       "workspaces",
       workspaceHash,
       "sessions",
@@ -867,9 +873,7 @@ async function testStaleShadowRepoLockIsRecovered(): Promise<void> {
 
     const workspaceHash = createHash("sha256").update(path.normalize(ctx.cwd)).digest("hex").slice(0, 24);
     const sessionRoot = path.join(
-      getAgentDir(),
-      "state",
-      "workspace-history",
+      getWorkspaceHistoryStateDir(ctx.rootDir),
       "workspaces",
       workspaceHash,
       "sessions",
@@ -1013,8 +1017,10 @@ async function testRestoreFailureDoesNotDeleteCurrentWorkspace(): Promise<void> 
 
     const sessionId = session.sessionManager.getSessionId();
     const workspaceHash = createHash("sha256").update(ctx.cwd).digest("hex").slice(0, 24);
-    const gitDir = path.join(getAgentDir(), "state", "workspace-history", "workspaces", workspaceHash, "sessions", sessionId, "repo.git");
+    const workspaceRoot = path.join(getWorkspaceHistoryStateDir(ctx.rootDir), "workspaces", workspaceHash);
+    const gitDir = path.join(workspaceRoot, "sessions", sessionId, "repo.git");
     await rm(gitDir, { recursive: true, force: true });
+    await rm(path.join(workspaceRoot, "repo.git"), { recursive: true, force: true });
 
     const baseline = session.sessionManager
       .getEntries()
