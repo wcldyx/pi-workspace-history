@@ -12,6 +12,7 @@ import {
   mkdir,
   readFile,
   realpath,
+  stat,
   unlink,
   writeFile,
   mkdir as fsMkdir,
@@ -32,6 +33,8 @@ const DEFAULT_MAX_SCAN_FILES = 20_000;
 const DEFAULT_MAX_SCAN_DIRS = 3_000;
 const DEFAULT_MAX_SCAN_MS = 5_000;
 const DEFAULT_GIT_TIMEOUT_MS = 10_000;
+const SHADOW_REPO_LOCK_WAIT_MS = 5_000;
+const SHADOW_REPO_LOCK_STALE_MS = 15_000;
 const PROJECT_MARKER_FILES = [
   ".git",
   "package.json",
@@ -213,6 +216,48 @@ async function exists(filePath: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForShadowRepoIndexLock(ctx: ExtensionContext, state?: RuntimeState): Promise<boolean> {
+  const paths = await getWorkspaceStoragePaths(ctx, state);
+  const lockPath = path.join(paths.shadowGitDir, "index.lock");
+
+  for (const startedAt = Date.now(); Date.now() - startedAt < SHADOW_REPO_LOCK_WAIT_MS;) {
+    if (!await exists(lockPath)) {
+      return true;
+    }
+
+    const lockStat = await stat(lockPath).catch(() => undefined);
+    if (lockStat && Date.now() - lockStat.mtimeMs > SHADOW_REPO_LOCK_STALE_MS) {
+      await unlink(lockPath).catch(() => undefined);
+      return !await exists(lockPath);
+    }
+
+    await sleep(100);
+  }
+
+  return !await exists(lockPath);
+}
+
+async function clearStaleShadowRepoIndexLock(ctx: ExtensionContext, state?: RuntimeState): Promise<boolean> {
+  const paths = await getWorkspaceStoragePaths(ctx, state);
+  const lockPath = path.join(paths.shadowGitDir, "index.lock");
+
+  if (!await exists(lockPath)) {
+    return false;
+  }
+
+  const lockStat = await stat(lockPath).catch(() => undefined);
+  if (lockStat && Date.now() - lockStat.mtimeMs <= SHADOW_REPO_LOCK_STALE_MS) {
+    return false;
+  }
+
+  await unlink(lockPath).catch(() => undefined);
+  return true;
 }
 
 function getAgentDir(): string {
@@ -695,9 +740,23 @@ async function syncShadowRepoExclude(ctx: ExtensionContext, state?: RuntimeState
 async function execGit(pi: ExtensionAPI, ctx: ExtensionContext, args: string[]): Promise<string> {
   const state = undefined;
   const timeoutMs = await getGitTimeoutMs(ctx, state);
-  const result = await withTimeout(pi.exec("git", args, { cwd: ctx.cwd }), timeoutMs, `git ${args[0] ?? "command"}`);
+  const paths = await getWorkspaceStoragePaths(ctx, state);
+  const usesShadowGitDir = args.includes("--git-dir") && args.includes(paths.shadowGitDir);
+  const runGit = () => withTimeout(pi.exec("git", args, { cwd: ctx.cwd }), timeoutMs, `git ${args[0] ?? "command"}`);
+  if (usesShadowGitDir) {
+    await waitForShadowRepoIndexLock(ctx, state);
+  }
+  const result = await runGit();
   if (result.code !== 0) {
-    throw new Error(`git ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
+    const output = result.stderr || result.stdout;
+    if (usesShadowGitDir && output.includes("index.lock") && (await waitForShadowRepoIndexLock(ctx, state) || await clearStaleShadowRepoIndexLock(ctx, state))) {
+      const retry = await runGit();
+      if (retry.code === 0) {
+        return retry.stdout.trim();
+      }
+      throw new Error(`git ${args.join(" ")} failed after clearing stale index.lock: ${retry.stderr || retry.stdout}`);
+    }
+    throw new Error(`git ${args.join(" ")} failed: ${output}`);
   }
   return result.stdout.trim();
 }

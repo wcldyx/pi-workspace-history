@@ -1,8 +1,10 @@
-import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import {
   AuthStorage,
   type CustomEntry,
@@ -44,6 +46,8 @@ type TurnSnapshotState = {
     createdAt: string;
   }>;
 };
+
+const execFileAsync = promisify(execFile);
 
 async function createContextForWorkspace(rootDir: string, cwd: string, withProjectMarker = true): Promise<TestContext> {
   const authStorage = AuthStorage.inMemory();
@@ -851,6 +855,45 @@ async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
   }
 }
 
+async function testStaleShadowRepoLockIsRecovered(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "lock-recovery.txt", content: "recovered\n" })]),
+      fauxAssistantMessage("created lock recovery file"),
+    ]);
+
+    const workspaceHash = createHash("sha256").update(path.normalize(ctx.cwd)).digest("hex").slice(0, 24);
+    const sessionRoot = path.join(
+      getAgentDir(),
+      "state",
+      "workspace-history",
+      "workspaces",
+      workspaceHash,
+      "sessions",
+      session.sessionManager.getSessionId(),
+    );
+    const gitDir = path.join(sessionRoot, "repo.git");
+    await rm(gitDir, { recursive: true, force: true });
+    await mkdir(sessionRoot, { recursive: true });
+    await execFileAsync("git", ["init", "--bare", gitDir], { cwd: ctx.cwd });
+    const lockPath = path.join(gitDir, "index.lock");
+    await writeFile(lockPath, "stale lock\n", "utf8");
+    const staleTime = new Date(Date.now() - 60_000);
+    await utimes(lockPath, staleTime, staleTime);
+
+    await session.prompt("create lock recovery file");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "after snapshot should be created after stale lock recovery");
+    assert.equal(await exists(lockPath), false, "stale index.lock should be removed automatically");
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
 async function testUnicodePathsSurviveUndoRedo(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -1009,6 +1052,7 @@ async function main(): Promise<void> {
     { name: ".pi files are managed except internal state", run: testPiFilesAreSnapshotManagedExceptInternalState },
     { name: "history is stored outside workspace", run: testHistoryIsStoredOutsideWorkspace },
     { name: "new session reuses workspace shadow repo", run: testNewSessionReusesWorkspaceShadowRepo },
+    { name: "stale shadow repo lock is recovered", run: testStaleShadowRepoLockIsRecovered },
     { name: "unicode paths survive undo and redo", run: testUnicodePathsSurviveUndoRedo },
     { name: "undo and redo block on unsnapshotted manual changes", run: testUndoAndRedoBlockOnUnsnapshottedManualChanges },
     { name: ".gitignore stops managing ignored paths", run: testGitignoreStopsManagingIgnoredPaths },
