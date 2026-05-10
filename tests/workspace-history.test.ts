@@ -844,7 +844,7 @@ async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
       "repo.git",
     );
 
-    await waitFor(async () => await pathExists(path.join(gitDir, "objects")), "second session shadow git repo should exist");
+    await waitFor(async () => await pathExists(path.join(gitDir, "objects")), "second session shadow git repo should exist", 10000);
     const head = await readFile(path.join(gitDir, "HEAD"), "utf8");
     assert.match(head, /refs\/heads|[0-9a-f]{40}/, "second session should have a cloned shadow repo with HEAD");
 

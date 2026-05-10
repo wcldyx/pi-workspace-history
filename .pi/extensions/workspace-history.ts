@@ -32,7 +32,7 @@ const DEFAULT_MAX_WORKSPACES = 10;
 const DEFAULT_MAX_SCAN_FILES = 20_000;
 const DEFAULT_MAX_SCAN_DIRS = 3_000;
 const DEFAULT_MAX_SCAN_MS = 5_000;
-const DEFAULT_GIT_TIMEOUT_MS = 10_000;
+const DEFAULT_GIT_TIMEOUT_MS = 60_000;
 const SHADOW_REPO_LOCK_WAIT_MS = 5_000;
 const SHADOW_REPO_LOCK_STALE_MS = 15_000;
 const PROJECT_MARKER_FILES = [
@@ -714,6 +714,26 @@ async function logLine(ctx: ExtensionContext, line: string, state?: RuntimeState
   await appendFile(paths.logFile, `[${new Date().toISOString()}] ${line}\n`, "utf8");
 }
 
+function elapsedMs(startedAt: number): number {
+  return Date.now() - startedAt;
+}
+
+function summarizeGitArgs(args: string[]): string {
+  const gitDirIndex = args.indexOf("--git-dir");
+  const workTreeIndex = args.indexOf("--work-tree");
+  if (gitDirIndex >= 0 && workTreeIndex >= 0) {
+    return [
+      ...args.slice(0, gitDirIndex),
+      "--git-dir",
+      "<shadowGitDir>",
+      "--work-tree",
+      "<workspace>",
+      ...args.slice(workTreeIndex + 2),
+    ].join(" ");
+  }
+  return args.join(" ");
+}
+
 async function syncShadowRepoExclude(ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
   const paths = await ensureStorageDirs(ctx, state);
   const gitignoreSource = await readFile(path.join(ctx.cwd, ".gitignore"), "utf8").catch(() => "");
@@ -742,8 +762,10 @@ async function execGit(pi: ExtensionAPI, ctx: ExtensionContext, args: string[]):
   const timeoutMs = await getGitTimeoutMs(ctx, state);
   const paths = await getWorkspaceStoragePaths(ctx, state);
   const usesShadowGitDir = args.includes("--git-dir") && args.includes(paths.shadowGitDir);
+  const startedAt = Date.now();
   const runGit = () => withTimeout(pi.exec("git", args, { cwd: ctx.cwd }), timeoutMs, `git ${args[0] ?? "command"}`);
   if (usesShadowGitDir) {
+    await logLine(ctx, `git start ${summarizeGitArgs(args)}`, state);
     await waitForShadowRepoIndexLock(ctx, state);
   }
   const result = await runGit();
@@ -752,11 +774,15 @@ async function execGit(pi: ExtensionAPI, ctx: ExtensionContext, args: string[]):
     if (usesShadowGitDir && output.includes("index.lock") && (await waitForShadowRepoIndexLock(ctx, state) || await clearStaleShadowRepoIndexLock(ctx, state))) {
       const retry = await runGit();
       if (retry.code === 0) {
+        await logLine(ctx, `git ok retry ${elapsedMs(startedAt)}ms ${summarizeGitArgs(args)}`, state).catch(() => undefined);
         return retry.stdout.trim();
       }
       throw new Error(`git ${args.join(" ")} failed after clearing stale index.lock: ${retry.stderr || retry.stdout}`);
     }
     throw new Error(`git ${args.join(" ")} failed: ${output}`);
+  }
+  if (usesShadowGitDir) {
+    await logLine(ctx, `git ok ${elapsedMs(startedAt)}ms ${summarizeGitArgs(args)}`, state).catch(() => undefined);
   }
   return result.stdout.trim();
 }
@@ -833,31 +859,41 @@ async function removeExcludedPathsFromShadowIndex(
 }
 
 async function pruneShadowIndexForIgnoreChanges(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
+  const startedAt = Date.now();
   const gitignoreSource = await readFile(path.join(ctx.cwd, ".gitignore"), "utf8").catch(() => "");
   if (state?.lastIndexPruneIgnoreSource === gitignoreSource) {
+    await logLine(ctx, `prune ignored paths skipped cached ${elapsedMs(startedAt)}ms`, state);
     return;
   }
 
   if (state && state.lastIndexPruneIgnoreSource === undefined) {
     state.lastIndexPruneIgnoreSource = gitignoreSource;
+    await logLine(ctx, `prune ignored paths skipped initial ${elapsedMs(startedAt)}ms`, state);
     return;
   }
 
   const excludedPaths = await listExcludedWorkspacePaths(ctx, state);
+  await logLine(ctx, `prune ignored paths scanned ${elapsedMs(startedAt)}ms count=${excludedPaths.length}`, state);
   await removeExcludedPathsFromShadowIndex(pi, ctx, excludedPaths, state);
   if (state) {
     state.lastIndexPruneIgnoreSource = gitignoreSource;
     state.lastExcludedWorkspacePaths = excludedPaths;
   }
+  await logLine(ctx, `prune ignored paths done ${elapsedMs(startedAt)}ms count=${excludedPaths.length}`, state);
 }
 
 
 async function stageSnapshotFiles(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
+  const startedAt = Date.now();
+  await logLine(ctx, "stage snapshot start", state);
   await execGit(pi, ctx, await gitArgs(ctx, state, "add", "-A", "--", "."));
+  await logLine(ctx, `stage snapshot git-add done ${elapsedMs(startedAt)}ms`, state);
   await pruneShadowIndexForIgnoreChanges(pi, ctx, state);
+  await logLine(ctx, `stage snapshot done ${elapsedMs(startedAt)}ms`, state);
 }
 
 async function hasWorkspaceChanges(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<boolean> {
+  const startedAt = Date.now();
   await assertWorkspaceHistoryEnabled(ctx, state, "hasWorkspaceChanges");
   await ensureShadowRepo(pi, ctx, state);
 
@@ -870,7 +906,9 @@ async function hasWorkspaceChanges(pi: ExtensionAPI, ctx: ExtensionContext, stat
     throw new Error(statusResult.stderr || statusResult.stdout || "git status failed");
   }
 
-  return statusResult.stdout.length > 0;
+  const changed = statusResult.stdout.length > 0;
+  await logLine(ctx, `workspace changes check done ${elapsedMs(startedAt)}ms changed=${String(changed)}`, state);
+  return changed;
 }
 
 async function hasHeadCommit(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<boolean> {
@@ -885,10 +923,12 @@ async function hasHeadCommit(pi: ExtensionAPI, ctx: ExtensionContext, state?: Ru
 }
 
 async function ensureShadowRepo(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
+  const startedAt = Date.now();
   await assertWorkspaceHistoryEnabled(ctx, state, "ensureShadowRepo");
   const paths = await ensureStorageDirs(ctx, state);
   if (await exists(paths.shadowGitDir)) {
     await syncShadowRepoExclude(ctx, state);
+    await logLine(ctx, `ensure shadow repo existing done ${elapsedMs(startedAt)}ms`, state);
     return;
   }
 
@@ -902,6 +942,7 @@ async function ensureShadowRepo(pi: ExtensionAPI, ctx: ExtensionContext, state?:
     await logLine(ctx, `init repo session=${ctx.sessionManager.getSessionId()} gitDir=${paths.shadowGitDir}`, state);
   }
   await syncShadowRepoExclude(ctx, state);
+  await logLine(ctx, `ensure shadow repo created done ${elapsedMs(startedAt)}ms`, state);
 }
 
 async function createSnapshotCommit(
@@ -911,18 +952,24 @@ async function createSnapshotCommit(
   state?: RuntimeState,
 ): Promise<string> {
   return runSerializedSnapshotWrite(state, async () => {
+    const startedAt = Date.now();
+    await logLine(ctx, `snapshot commit start label=${label}`, state);
     await assertWorkspaceHistoryEnabled(ctx, state, "createSnapshotCommit");
     await ensureShadowRepo(pi, ctx, state);
     if (await hasHeadCommit(pi, ctx, state) && !await hasWorkspaceChanges(pi, ctx, state)) {
       await touchWorkspaceAndSessionMeta(ctx, state);
       scheduleCleanup(ctx, state);
-      return execGit(pi, ctx, await gitArgs(ctx, state, "rev-parse", "HEAD"));
+      const commit = await execGit(pi, ctx, await gitArgs(ctx, state, "rev-parse", "HEAD"));
+      await logLine(ctx, `snapshot commit reused label=${label} commit=${commit} ${elapsedMs(startedAt)}ms`, state);
+      return commit;
     }
     await stageSnapshotFiles(pi, ctx, state);
     await execGit(pi, ctx, [...(await gitCommitArgs(ctx, state, "commit", "--allow-empty", "-m", `[workspace-history] ${label}`))]);
     await touchWorkspaceAndSessionMeta(ctx, state);
     scheduleCleanup(ctx, state);
-    return execGit(pi, ctx, await gitArgs(ctx, state, "rev-parse", "HEAD"));
+    const commit = await execGit(pi, ctx, await gitArgs(ctx, state, "rev-parse", "HEAD"));
+    await logLine(ctx, `snapshot commit created label=${label} commit=${commit} ${elapsedMs(startedAt)}ms`, state);
+    return commit;
   });
 }
 
@@ -1466,7 +1513,7 @@ async function restoreResolvedSnapshot(
 }
 
 const CLEANUP_INTERVAL_MS = 60_000;
-const BASELINE_WARMUP_DELAY_MS = 0;
+const BASELINE_WARMUP_DELAY_MS = 5_000;
 
 function scheduleCleanup(ctx: ExtensionContext, state?: RuntimeState): void {
   if (!state) {
@@ -1578,7 +1625,9 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.baselineWarmupTimer = setTimeout(() => {
       state.baselineWarmupTimer = undefined;
       state.baselineWarmupPromise = (async () => {
+        const startedAt = Date.now();
         state.baselineWarmupInProgress = true;
+        await logLine(ctx, `warm baseline start generation=${generation}`, state);
         try {
           if (
             state.baselineWarmupGeneration !== generation ||
@@ -1605,6 +1654,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
           await logLine(ctx, `warm baseline failed error=${String(error)}`, state).catch(() => undefined);
         } finally {
           state.baselineWarmupInProgress = false;
+          await logLine(ctx, `warm baseline end generation=${generation} ${elapsedMs(startedAt)}ms`, state).catch(() => undefined);
           if (state.baselineWarmupPromise) {
             state.baselineWarmupPromise = undefined;
           }
@@ -1632,6 +1682,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     }
 
     const beforeSnapshotPromise = (async () => {
+      const startedAt = Date.now();
       cancelBaselineWarmup(state);
       await clearRedoStack(ctx, state);
 
@@ -1641,6 +1692,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       let commit: string;
 
       if (isFirstSnapshot) {
+        await logLine(ctx, `before snapshot start turn=${turnId} first=true prompt=${String(promptText ?? "")}`, state);
         if (!state.warmedBaselineCommit && !state.initializationNoticeShown) {
           ctx.ui.notify("Initializing workspace history for this project. The first prompt may take a moment.", "info");
           state.initializationNoticeShown = true;
@@ -1663,6 +1715,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         state.baselineWarmupGeneration = undefined;
         await ensureBaselineSnapshot(pi, ctx, state, commit);
       } else {
+        await logLine(ctx, `before snapshot start turn=${turnId} first=false prompt=${String(promptText ?? "")}`, state);
         const previousAfter = findAfterSnapshotOnCurrentBranch(ctx, state);
         if (previousAfter && !await isWorkspaceDirtyAgainstCommit(pi, ctx, previousAfter.commit, state)) {
           commit = previousAfter.commit;
@@ -1677,7 +1730,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
       await logLine(
         ctx,
-        `create before snapshot turn=${turnId} commit=${commit} leaf=${ctx.sessionManager.getLeafId()}`,
+        `create before snapshot turn=${turnId} commit=${commit} leaf=${ctx.sessionManager.getLeafId()} ${elapsedMs(startedAt)}ms`,
         state,
       );
     })();
@@ -1694,7 +1747,9 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    const startedAt = Date.now();
     const state = getState(ctx);
+    await logLine(ctx, `session_start begin session=${ctx.sessionManager.getSessionId()}`, state).catch(() => undefined);
     state.pendingTurnId = undefined;
     state.pendingBeforeCommit = undefined;
     state.pendingPromptText = undefined;
@@ -1720,19 +1775,25 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     await readTurnSnapshotState(ctx, state);
     scheduleCleanup(ctx, state);
     scheduleBaselineWarmup(ctx, state);
+    await logLine(ctx, `session_start done ${elapsedMs(startedAt)}ms session=${ctx.sessionManager.getSessionId()}`, state);
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
+    const startedAt = Date.now();
     const state = getState(ctx);
+    await logLine(ctx, "before_agent_start begin", state).catch(() => undefined);
     if (!await ensureWorkspaceHistoryAvailable(ctx, state, "before_agent_start")) {
       return;
     }
     state.pendingPromptText = event.prompt;
     await ensureBeforeSnapshotForTurn(ctx, state, event.prompt);
+    await logLine(ctx, `before_agent_start done ${elapsedMs(startedAt)}ms`, state);
   });
 
   pi.on("turn_start", async (_event, ctx) => {
+    const startedAt = Date.now();
     const state = getState(ctx);
+    await logLine(ctx, "turn_start begin", state).catch(() => undefined);
     if (!await ensureWorkspaceHistoryAvailable(ctx, state, "turn_start")) {
       return;
     }
@@ -1740,6 +1801,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       return;
     }
     await ensureBeforeSnapshotForTurn(ctx, state, state.pendingPromptText);
+    await logLine(ctx, `turn_start done ${elapsedMs(startedAt)}ms`, state);
   });
 
   pi.on("turn_end", async (event, ctx) => {
