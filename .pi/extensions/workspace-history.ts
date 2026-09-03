@@ -418,6 +418,27 @@ async function isInsideJujutsuMetadata(cwd: string): Promise<boolean> {
   }
 }
 
+async function isMultiRepoContainer(cwd: string): Promise<boolean> {
+  try {
+    const entries = await readdir(cwd, { withFileTypes: true });
+    let repoCount = 0;
+    for (const entry of entries) {
+      if (entry.isDirectory() && !entry.name.startsWith(".")) {
+        const subDir = path.join(cwd, entry.name);
+        if (await pathExists(path.join(subDir, ".git")) || await pathExists(path.join(subDir, ".jj"))) {
+          repoCount++;
+          if (repoCount >= 2) {
+            return true;
+          }
+        }
+      }
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
 function normalizePathForComparison(filePath: string): string {
   const normalized = path.normalize(filePath);
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
@@ -517,6 +538,8 @@ async function evaluateWorkspaceHistoryAvailability(ctx: ExtensionContext, state
       availability = { enabled: false, reason: "current directory is a filesystem root" };
     } else if (settings.requireProjectMarker && !(await hasProjectMarker(resolvedCwd))) {
       availability = { enabled: false, reason: "no project marker found" };
+    } else if (!(await pathExists(path.join(resolvedCwd, ".git"))) && !(await pathExists(path.join(resolvedCwd, ".jj"))) && (await isMultiRepoContainer(resolvedCwd))) {
+      availability = { enabled: false, reason: "workspace is a multi-repo container without root git" };
     } else {
       availability = { enabled: true };
     }
