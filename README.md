@@ -106,19 +106,24 @@ This plugin is built around the following concrete requirements:
 
 The plugin stores snapshots in an internal shadow git repository instead of relying on the user's project `.git` history.
 
+The same file-history workflow works in Git repositories, Jujutsu repositories, and colocated Git/Jujutsu repositories. Repository metadata (`.git/` and `.jj/`) is never snapshotted or restored. Consequently, workspace undo restores file contents but does not rewind Git commits, branches, or the index, nor Jujutsu commits, bookmarks, or operations. After an undo, `git status` or `jj status` may show the restored files as working-copy changes; use the VCS's own recovery commands when repository history must also change.
+
+The extension still requires the Git executable for its private shadow repository, including when the workspace itself uses only Jujutsu.
+
 A single undo unit lasts from the original prompt until Pi reports that the agent is settled. Intermediate tool rounds receive their own tree anchors, but queued input never replaces the operation's original prompt or `before` snapshot. One `/undo` therefore removes the complete result of a multi-round operation, and `/redo` restores it as a unit.
 
 For conversation-only navigation without a branch summary, the plugin first resolves any pending recovery from an earlier interrupted restore. If files changed after that interrupted restore, those later edits are kept automatically. The plugin then snapshots the current files before moving the conversation and uses the snapshot as the seed of the continued history branch. Once the conversation continues, its normal visible message nodes restore that kept workspace state through `/tree`. Cancelling the choice leaves both conversation and workspace unchanged. In non-interactive modes, navigation keeps the previous combined conversation-and-workspace behavior.
 
 Default snapshot scope:
 
-- Git tracked files
-- Untracked files that are not ignored
+- Files already managed by the internal shadow repository
+- New files that are not ignored
 - Paths matched by the workspace `.gitignore` are filtered out even if they were previously snapshotted
 
 Default exclusions:
 
 - `.git/`
+- `.jj/`
 - `.pi/workspace-history/`
 - `node_modules/`
 - `dist/`
@@ -179,11 +184,13 @@ Settings:
   - Allow enabling in the user home directory
   - Default: `false`
 - `workspaceHistory.requireProjectMarker`
-  - Require a project marker such as `.git`, `package.json`, `Cargo.toml`, `go.mod`, or `pyproject.toml` in the current directory or an ancestor
+  - Require a project marker such as `.git`, `.jj`, `package.json`, `Cargo.toml`, `go.mod`, or `pyproject.toml` in the current directory or an ancestor
   - Default: `true`
   - When `false`, automatic mode accepts any directory except a filesystem root or the user home directory (unless `allowHomeDirectory` is also enabled)
-- `workspaceHistory.maxScanFiles` / `workspaceHistory.maxScanDirs` / `workspaceHistory.maxScanMs`
-  - Safety budget for workspace scanning
+- `workspaceHistory.maxScanFiles`
+- `workspaceHistory.maxScanDirs`
+- `workspaceHistory.maxScanMs`
+  - Safety limits for restore-time workspace scans
 - `workspaceHistory.gitTimeoutMs`
   - Timeout for internal git operations
 
@@ -237,6 +244,7 @@ npm run typecheck
 
 ## Recent Changes
 
+- Git, Jujutsu, and colocated repositories share the same file-history workflow while their VCS metadata remains untouched
 - Complete multi-round agent operations now form one undo/redo unit
 - Hard exclusions remain unmanaged even when `.gitignore` contains negation rules
 - Project markers are detected in ancestor directories for Git, Rust, Go, Python, and other declared project types

@@ -18,7 +18,14 @@ jobs:
         with:
           node-version: 22.19.0
           cache: npm
+      - name: Install Jujutsu
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: jj-cli@0.44.0
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+        env:
+          PI_WORKSPACE_HISTORY_REQUIRE_JUJUTSU: ${{ runner.os == 'Linux' && '1' || '0' }}
       - run: git diff --check

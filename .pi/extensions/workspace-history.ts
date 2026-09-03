@@ -25,7 +25,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 
 const SNAPSHOT_TYPE = "workspace-history.snapshot";
-const SNAPSHOT_RETENTION_REF_PREFIX = "refs/workspace-history/snapshots";
+const SNAPSHOT_RETENTION_REF_PREFIX = "refs/wh/s";
 const ACTIVE_SESSION_LEASE_FILE = "active-session.json";
 
 const DEFAULT_MAX_SESSIONS_PER_WORKSPACE = 3;
@@ -40,6 +40,7 @@ const RESTORE_FILE_LOCK_RETRY_DELAYS_MS = [100, 250, 500] as const;
 const WORKSPACE_HISTORY_LOG_ENV = "PI_WORKSPACE_HISTORY_LOG";
 const PROJECT_MARKER_FILES = [
   ".git",
+  ".jj",
   "package.json",
   "pnpm-workspace.yaml",
   "pyproject.toml",
@@ -237,6 +238,7 @@ interface SessionLease {
 
 const DEFAULT_EXCLUDES = [
   ".git",
+  ".jj",
   ".pi/workspace-history",
   "node_modules",
   "dist",
@@ -402,6 +404,20 @@ async function hasProjectMarker(cwd: string): Promise<boolean> {
   }
 }
 
+async function isInsideJujutsuMetadata(cwd: string): Promise<boolean> {
+  let current = await realpath(cwd).catch(() => path.resolve(cwd));
+  for (;;) {
+    if (normalizePathForComparison(path.basename(current)) === normalizePathForComparison(".jj")) {
+      return true;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return false;
+    }
+    current = parent;
+  }
+}
+
 function normalizePathForComparison(filePath: string): string {
   const normalized = path.normalize(filePath);
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
@@ -485,6 +501,8 @@ async function evaluateWorkspaceHistoryAvailability(ctx: ExtensionContext, state
     };
   } else if (settings.enabled === false) {
     availability = { enabled: false, reason: "disabled by configuration" };
+  } else if (await isInsideJujutsuMetadata(ctx.cwd)) {
+    availability = { enabled: false, reason: "current directory is inside Jujutsu metadata" };
   } else if (settings.enabled === true) {
     availability = { enabled: true };
   } else {

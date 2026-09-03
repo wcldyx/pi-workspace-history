@@ -1,4 +1,4 @@
-import { access, copyFile, mkdtemp, mkdir, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdtemp, mkdir, readFile, readdir, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
@@ -51,10 +51,43 @@ type TurnSnapshotState = {
   }>;
 };
 
+const workspaceHashByCwd = new Map<string, string>();
+const SNAPSHOT_RETENTION_REF_PREFIX = "refs/wh/s";
+
 const execFileAsync = promisify(execFile);
+
+async function hasJujutsu(): Promise<boolean> {
+  try {
+    await execFileAsync("jj", ["--version"]);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      if (process.env.PI_WORKSPACE_HISTORY_REQUIRE_JUJUTSU === "1") {
+        throw new Error("Jujutsu is required for this test run, but jj was not found on PATH");
+      }
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function getJujutsuOperationId(cwd: string): Promise<string> {
+  const { stdout } = await execFileAsync(
+    "jj",
+    ["--ignore-working-copy", "--no-pager", "-R", cwd, "op", "log", "-n", "1", "--no-graph", "-T", "id"],
+    { cwd },
+  );
+  return stdout.trim();
+}
+
 const ASYNC_ASSERTION_TIMEOUT_MS = 15_000;
 
 async function createContextForWorkspace(rootDir: string, cwd: string, withProjectMarker = true): Promise<TestContext> {
+  const resolvedCwd = await realpath(cwd).catch(() => path.resolve(cwd));
+  workspaceHashByCwd.set(
+    path.normalize(cwd),
+    createHash("sha256").update(path.normalize(resolvedCwd)).digest("hex").slice(0, 24),
+  );
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: false },
     retry: { enabled: false, maxRetries: 0 },
@@ -145,17 +178,13 @@ async function writeWorkspaceHistorySettings(
 }
 
 async function disposeContext(ctx: TestContext): Promise<void> {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    try {
-      await rm(ctx.rootDir, { recursive: true, force: true });
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EBUSY") {
-        throw error;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 150));
-    }
-  }
+  workspaceHashByCwd.delete(path.normalize(ctx.cwd));
+  await rm(ctx.rootDir, {
+    recursive: true,
+    force: true,
+    maxRetries: 10,
+    retryDelay: 100,
+  });
 }
 
 async function createSession(ctx: TestContext, sessionManager: SessionManager = SessionManager.inMemory(ctx.cwd)) {
@@ -455,8 +484,14 @@ async function holdWindowsFileWithoutDeleteSharing(
   };
 }
 
+function getWorkspaceHash(cwd: string): string {
+  const workspaceHash = workspaceHashByCwd.get(path.normalize(cwd));
+  assert.ok(workspaceHash, `workspace hash was not registered for ${cwd}`);
+  return workspaceHash;
+}
+
 function getSessionHistoryDir(session: Awaited<ReturnType<typeof createSession>>, cwd: string): string {
-  const workspaceHash = createHash("sha256").update(path.normalize(cwd)).digest("hex").slice(0, 24);
+  const workspaceHash = getWorkspaceHash(cwd);
   return path.join(
     getWorkspaceHistoryStateDir(path.dirname(cwd)),
     "workspaces",
@@ -1385,6 +1420,251 @@ async function testNonProjectWorkspaceDisablesExtension(): Promise<void> {
   }
 }
 
+async function testJujutsuOnlyWorkspacePreservesMetadata(): Promise<void> {
+  if (!await hasJujutsu()) {
+    return;
+  }
+
+  const ctx = await createNonProjectContext();
+  try {
+    await execFileAsync("jj", ["--quiet", "git", "init", "--no-colocate", "."], { cwd: ctx.cwd });
+    assert.equal(await pathExists(path.join(ctx.cwd, ".git")), false, "the fixture should be a non-colocated Jujutsu repository");
+    const operationId = await getJujutsuOperationId(ctx.cwd);
+    await writeWorkspaceHistorySettings(ctx, {
+      storageDir: getWorkspaceHistoryStateDir(ctx.rootDir),
+      maxScanFiles: 3,
+    });
+
+    const session = await createSession(ctx);
+    const notifications = captureNotifications(session);
+    const filePath = path.join(ctx.cwd, "managed.txt");
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "managed.txt", content: "managed\n" })]),
+      fauxAssistantMessage("created managed file"),
+    ]);
+
+    await session.prompt("create managed.txt");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "Jujutsu workspace snapshot was not created");
+
+    const { stdout: trackedPaths } = await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "ls-files"), { cwd: ctx.cwd });
+    assert.doesNotMatch(trackedPaths, /(^|\n)\.jj\//, "Jujutsu metadata must not enter snapshot history");
+
+    await session.prompt("/undo");
+    await waitForExists(filePath, false, `Jujutsu workspace undo failed: ${notifications.join(" | ")}`);
+    assert.equal(await getJujutsuOperationId(ctx.cwd), operationId, "workspace undo must not change Jujutsu operations");
+
+    await session.prompt("/redo");
+    await waitForText(filePath, "managed\n", "Jujutsu workspace redo should restore managed files");
+    assert.equal(await getJujutsuOperationId(ctx.cwd), operationId, "workspace redo must not change Jujutsu operations");
+
+    const { stdout: jjStatus } = await execFileAsync("jj", ["--no-pager", "status"], { cwd: ctx.cwd });
+    assert.match(jjStatus, /managed\.txt/, "Jujutsu should report the restored file as a working-copy change");
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testJujutsuMetadataDirectoryDisablesExtension(): Promise<void> {
+  if (!await hasJujutsu()) {
+    return;
+  }
+
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "pi-timemachine-test-"));
+  const repositoryDir = path.join(rootDir, "workspace");
+  await mkdir(repositoryDir, { recursive: true });
+  await execFileAsync("jj", ["--quiet", "git", "init", "--no-colocate", "."], { cwd: repositoryDir });
+  const ctx = await createContextForWorkspace(rootDir, path.join(repositoryDir, ".jj", "repo"), false);
+  try {
+    await writeWorkspaceHistorySettings(ctx, {
+      enabled: true,
+      storageDir: getWorkspaceHistoryStateDir(rootDir),
+    });
+    const session = await createSession(ctx);
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "agent-output.txt", content: "created\n" })]),
+      fauxAssistantMessage("created output"),
+    ]);
+
+    await session.prompt("create agent-output.txt");
+
+    assert.equal(await countSnapshots(session, ctx.cwd), 0, "workspace history must stay disabled inside .jj metadata");
+    assert.equal(await pathExists(getWorkspaceHistoryStateDir(rootDir)), false, "workspace history must not create storage inside .jj metadata");
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testGitRepositoryMetadataRemainsUntouched(): Promise<void> {
+  const ctx = await createNonProjectContext();
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: ctx.cwd });
+    await execFileAsync("git", ["config", "user.name", "workspace-history-test"], { cwd: ctx.cwd });
+    await execFileAsync("git", ["config", "user.email", "workspace-history-test@local"], { cwd: ctx.cwd });
+    await writeFile(path.join(ctx.cwd, "repository.txt"), "repository state\n", "utf8");
+    await execFileAsync("git", ["add", "repository.txt"], { cwd: ctx.cwd });
+    await execFileAsync("git", ["commit", "-m", "test repository state"], { cwd: ctx.cwd });
+    const userHead = await readText(path.join(ctx.cwd, ".git", "HEAD"));
+    const userIndex = await readFile(path.join(ctx.cwd, ".git", "index"));
+
+    const session = await createSession(ctx);
+    const managedPath = path.join(ctx.cwd, "git-managed.txt");
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "git-managed.txt", content: "managed\n" })]),
+      fauxAssistantMessage("created Git managed file"),
+    ]);
+
+    await session.prompt("create git-managed.txt");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "Git workspace snapshot was not created");
+    const { stdout: trackedPaths } = await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "ls-files"), { cwd: ctx.cwd });
+    assert.doesNotMatch(trackedPaths, /(^|\n)\.git\//, "Git metadata must not enter snapshot history");
+
+    await session.prompt("/undo");
+    await waitForExists(managedPath, false, "Git workspace undo should remove the managed file");
+    assert.equal(await readText(path.join(ctx.cwd, ".git", "HEAD")), userHead, "workspace undo must not change Git HEAD");
+    assert.deepEqual(await readFile(path.join(ctx.cwd, ".git", "index")), userIndex, "workspace undo must not change the Git index");
+
+    await session.prompt("/redo");
+    await waitForText(managedPath, "managed\n", "Git workspace redo should restore the managed file");
+    assert.equal(await readText(path.join(ctx.cwd, ".git", "HEAD")), userHead, "workspace redo must not change Git HEAD");
+    assert.deepEqual(await readFile(path.join(ctx.cwd, ".git", "index")), userIndex, "workspace redo must not change the Git index");
+
+    const { stdout: gitStatus } = await execFileAsync("git", ["status", "--short"], { cwd: ctx.cwd });
+    assert.match(gitStatus, /git-managed\.txt/, "Git should report the restored file as a working-tree change");
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testConcurrentSessionsInJujutsuWorkspace(): Promise<void> {
+  if (!await hasJujutsu()) {
+    return;
+  }
+
+  const ctx1 = await createNonProjectContext();
+  let ctx2: TestContext | undefined;
+  const sessions: Array<Awaited<ReturnType<typeof createSession>>> = [];
+  try {
+    await execFileAsync("jj", ["--quiet", "git", "init", "--no-colocate", "."], { cwd: ctx1.cwd });
+    const operationId = await getJujutsuOperationId(ctx1.cwd);
+    const filePath = path.join(ctx1.cwd, "shared.txt");
+    const session1 = await createSession(ctx1);
+    sessions.push(session1);
+    const session1Notifications = captureNotifications(session1);
+
+    ctx2 = await createContextForWorkspace(ctx1.rootDir, ctx1.cwd, false);
+    const session2 = await createSession(ctx2);
+    sessions.push(session2);
+    captureNotifications(session2);
+
+    ctx1.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "shared.txt", content: "session one\n" })]),
+      fauxAssistantMessage("created session one state"),
+    ]);
+    await session1.prompt("write session one state");
+    await waitFor(async () => await countSnapshots(session1, ctx1.cwd, "after") >= 1, "session one snapshot was not created");
+
+    ctx2.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "shared.txt", content: "session two\n" })]),
+      fauxAssistantMessage("created session two state"),
+    ]);
+    await session2.prompt("write session two state");
+    await waitFor(async () => await countSnapshots(session2, ctx2.cwd, "after") >= 1, "session two snapshot was not created");
+    await waitForText(filePath, "session two\n", "session two should own the latest workspace state");
+
+    const session1Leaf = session1.sessionManager.getLeafId();
+    await session1.prompt("/undo");
+    assert.equal(session1.sessionManager.getLeafId(), session1Leaf, "session one must not undo over session two's edit");
+    assert.equal(normalizeEol(await readText(filePath)), "session two\n", "a blocked undo must preserve session two's edit");
+    assert.ok(
+      session1Notifications.some((message) => /workspace changed|checkpoint/i.test(message)),
+      "session one should explain that another workspace edit blocks undo",
+    );
+
+    await session2.prompt("/undo");
+    await waitForText(filePath, "session one\n", "session two undo should restore the state it started from");
+    await session1.prompt("/undo");
+    await waitForExists(filePath, false, "session one undo should succeed once its state is current");
+
+    await session1.prompt("/redo");
+    await waitForText(filePath, "session one\n", "session one redo should restore its edit");
+    await session2.prompt("/redo");
+    await waitForText(filePath, "session two\n", "session two redo should restore its edit");
+
+    assert.equal(await getJujutsuOperationId(ctx1.cwd), operationId, "parallel Pi session history must not mutate Jujutsu operations");
+    assert.notEqual(getShadowGitDir(session1, ctx1.cwd), getShadowGitDir(session2, ctx2.cwd), "each Pi session needs an isolated shadow repository");
+    for (const session of sessions) {
+      const { stdout: trackedPaths } = await execFileAsync("git", shadowGitArgs(session, ctx1.cwd, "ls-files"), { cwd: ctx1.cwd });
+      assert.doesNotMatch(trackedPaths, /(^|\n)\.jj\//, "no Pi session may snapshot Jujutsu metadata");
+    }
+
+    const { stdout: jjStatus } = await execFileAsync("jj", ["--no-pager", "status"], { cwd: ctx1.cwd });
+    assert.match(jjStatus, /shared\.txt/, "Jujutsu should see the final restored edit");
+  } finally {
+    for (const session of sessions) {
+      session.dispose();
+    }
+    ctx2?.provider.unregister();
+    await disposeContext(ctx1);
+  }
+}
+
+async function testColocatedRepositoryMetadataRemainsUntouched(): Promise<void> {
+  if (!await hasJujutsu()) {
+    return;
+  }
+
+  const ctx = await createNonProjectContext();
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: ctx.cwd });
+    await execFileAsync("git", ["config", "user.name", "workspace-history-test"], { cwd: ctx.cwd });
+    await execFileAsync("git", ["config", "user.email", "workspace-history-test@local"], { cwd: ctx.cwd });
+    await writeFile(path.join(ctx.cwd, ".gitignore"), "!.jj/\n!.jj/state\n", "utf8");
+    await writeFile(path.join(ctx.cwd, "repository.txt"), "repository state\n", "utf8");
+    await execFileAsync("git", ["add", ".gitignore", "repository.txt"], { cwd: ctx.cwd });
+    await execFileAsync("git", ["commit", "-m", "test repository state"], { cwd: ctx.cwd });
+    await execFileAsync("jj", ["--quiet", "git", "init", "--colocate", "."], { cwd: ctx.cwd });
+    const operationId = await getJujutsuOperationId(ctx.cwd);
+    const userHead = await readText(path.join(ctx.cwd, ".git", "HEAD"));
+    const userIndex = await readFile(path.join(ctx.cwd, ".git", "index"));
+
+    const session = await createSession(ctx);
+    const managedPath = path.join(ctx.cwd, "colocated-managed.txt");
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "colocated-managed.txt", content: "managed\n" })]),
+      fauxAssistantMessage("created colocated managed file"),
+    ]);
+
+    await session.prompt("create colocated-managed.txt");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "colocated workspace snapshot was not created");
+    const { stdout: trackedPaths } = await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "ls-files"), { cwd: ctx.cwd });
+    assert.doesNotMatch(trackedPaths, /(^|\n)\.(?:git|jj)\//, "VCS metadata must not enter snapshot history");
+
+    await session.prompt("/undo");
+    await waitForExists(managedPath, false, "colocated workspace undo should remove the managed file");
+    assert.equal(await readText(path.join(ctx.cwd, ".git", "HEAD")), userHead, "workspace undo must not change Git HEAD");
+    assert.deepEqual(await readFile(path.join(ctx.cwd, ".git", "index")), userIndex, "workspace undo must not change the Git index");
+    assert.equal(await getJujutsuOperationId(ctx.cwd), operationId, "workspace undo must not change Jujutsu operations");
+
+    await session.prompt("/redo");
+    await waitForText(managedPath, "managed\n", "colocated workspace redo should restore the managed file");
+    assert.equal(await readText(path.join(ctx.cwd, ".git", "HEAD")), userHead, "workspace redo must not change Git HEAD");
+    assert.deepEqual(await readFile(path.join(ctx.cwd, ".git", "index")), userIndex, "workspace redo must not change the Git index");
+    assert.equal(await getJujutsuOperationId(ctx.cwd), operationId, "workspace redo must not change Jujutsu operations");
+
+    const { stdout: jjStatus } = await execFileAsync("jj", ["--no-pager", "status"], { cwd: ctx.cwd });
+    assert.match(jjStatus, /colocated-managed\.txt/, "Jujutsu should report the restored colocated file");
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
 async function testUndoWorksFromTreeSelectedUserNode(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -1653,15 +1933,18 @@ async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
     const session1GitDir = getShadowGitDir(session1, ctx1.cwd);
     const retainedSessionRefs = await execFileAsync(
       "git",
-      ["--git-dir", session1GitDir, "for-each-ref", "--format=%(refname)", "refs/workspace-history"],
+      ["--git-dir", session1GitDir, "for-each-ref", "--format=%(refname)", SNAPSHOT_RETENTION_REF_PREFIX],
       { cwd: ctx1.cwd },
     );
-    assert.match(retainedSessionRefs.stdout, /refs\/workspace-history\/snapshots\//, "session repo should retain snapshot refs");
+    assert.ok(
+      retainedSessionRefs.stdout.includes(`${SNAPSHOT_RETENTION_REF_PREFIX}/`),
+      "session repo should retain snapshot refs",
+    );
     session1.dispose();
 
     const ctx2 = await createContextForWorkspace(ctx1.rootDir, ctx1.cwd);
     const session2 = await createSession(ctx2);
-    const workspaceHash = createHash("sha256").update(path.normalize(ctx1.cwd)).digest("hex").slice(0, 24);
+    const workspaceHash = getWorkspaceHash(ctx1.cwd);
     const gitDir = path.join(
       getWorkspaceHistoryStateDir(ctx1.rootDir),
       "workspaces",
@@ -1674,12 +1957,25 @@ async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
     await waitFor(async () => await pathExists(path.join(gitDir, "objects")), "second session shadow git repo should exist", 10000);
     const head = await readFile(path.join(gitDir, "HEAD"), "utf8");
     assert.match(head, /refs\/heads|[0-9a-f]{40}/, "second session should have a cloned shadow repo with HEAD");
+    ctx2.provider.setResponses([fauxAssistantMessage("verified reusable shadow state")]);
+    await session2.prompt("verify reusable shadow state");
+    await waitFor(async () => await countSnapshots(session2, ctx2.cwd, "after") >= 1, "second session snapshot was not created");
+
+    const secondSessionSnapshots = (await readTurnSnapshots(session2, ctx2.cwd)).turns;
+    const expectedRetentionRefs = new Set(secondSessionSnapshots.flatMap((turn) => [
+      `${SNAPSHOT_RETENTION_REF_PREFIX}/${turn.beforeCommit}`,
+      `${SNAPSHOT_RETENTION_REF_PREFIX}/${turn.afterCommit}`,
+    ]));
     const inheritedRetentionRefs = await execFileAsync(
       "git",
-      ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)", "refs/workspace-history"],
+      ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)", SNAPSHOT_RETENTION_REF_PREFIX],
       { cwd: ctx1.cwd },
     );
-    assert.equal(inheritedRetentionRefs.stdout.trim(), "", "new sessions should not inherit another session's retention refs");
+    assert.deepEqual(
+      new Set(inheritedRetentionRefs.stdout.trim().split(/\r?\n/).filter(Boolean)),
+      expectedRetentionRefs,
+      "new sessions should retain only commits referenced by their own history",
+    );
 
     session2.dispose();
     ctx2.provider.unregister();
@@ -1843,7 +2139,7 @@ async function testRetentionCleanupHonorsCrossProcessLease(): Promise<void> {
       storageDir: getWorkspaceHistoryStateDir(ctx1.rootDir),
       maxSessionsPerWorkspace: 1,
     });
-    const workspaceHash = createHash("sha256").update(path.normalize(ctx1.cwd)).digest("hex").slice(0, 24);
+    const workspaceHash = getWorkspaceHash(ctx1.cwd);
     const sessionsRoot = path.join(
       getWorkspaceHistoryStateDir(ctx1.rootDir),
       "workspaces",
@@ -1919,7 +2215,7 @@ async function testRetentionCleanupRequiresValidMetadata(): Promise<void> {
       maxWorkspaces: 2,
     });
     const storageDir = getWorkspaceHistoryStateDir(ctx.rootDir);
-    const workspaceHash = createHash("sha256").update(path.normalize(ctx.cwd)).digest("hex").slice(0, 24);
+    const workspaceHash = getWorkspaceHash(ctx.cwd);
     const workspaceRoot = path.join(storageDir, "workspaces", workspaceHash);
     const sessionsRoot = path.join(workspaceRoot, "sessions");
 
@@ -1991,7 +2287,7 @@ async function testRetentionCleanupLogsDeletionFailure(): Promise<void> {
       storageDir: getWorkspaceHistoryStateDir(ctx.rootDir),
       maxSessionsPerWorkspace: 1,
     });
-    const workspaceHash = createHash("sha256").update(path.normalize(ctx.cwd)).digest("hex").slice(0, 24);
+    const workspaceHash = getWorkspaceHash(ctx.cwd);
     const oldSessionRoot = path.join(
       getWorkspaceHistoryStateDir(ctx.rootDir),
       "workspaces",
@@ -2660,7 +2956,7 @@ async function testFailedShadowRepoRebuildDoesNotLeaveCanonicalRepo(): Promise<v
 
       await assert.rejects(
         session2.prompt("create after rebuild retry"),
-        /Unable to rebuild shadow repository[\s\S]*(?:tree|object)/i,
+        /Unable to rebuild shadow repository[\s\S]*(?:tree|object|does not appear to be a git repository)/i,
         "a corrupt reusable source should surface the Git rebuild failure",
       );
       assert.equal(await pathExists(session2GitDir), false, "failed rebuild should not leave a repo at the canonical path");
@@ -2699,7 +2995,7 @@ async function testStaleShadowRepoLockIsRecovered(): Promise<void> {
       fauxAssistantMessage("created lock recovery file"),
     ]);
 
-    const workspaceHash = createHash("sha256").update(path.normalize(ctx.cwd)).digest("hex").slice(0, 24);
+    const workspaceHash = getWorkspaceHash(ctx.cwd);
     const sessionRoot = path.join(
       getWorkspaceHistoryStateDir(ctx.rootDir),
       "workspaces",
@@ -2844,7 +3140,7 @@ async function testRestoreFailureDoesNotDeleteCurrentWorkspace(): Promise<void> 
     await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "safe file after snapshot was not created");
 
     const sessionId = session.sessionManager.getSessionId();
-    const workspaceHash = createHash("sha256").update(ctx.cwd).digest("hex").slice(0, 24);
+    const workspaceHash = getWorkspaceHash(ctx.cwd);
     const workspaceRoot = path.join(getWorkspaceHistoryStateDir(ctx.rootDir), "workspaces", workspaceHash);
     const gitDir = path.join(workspaceRoot, "sessions", sessionId, "repo.git");
     await rm(gitDir, { recursive: true, force: true });
@@ -2921,6 +3217,9 @@ async function testLegacyTrackedHardExcludeIsPrunedAndPreservedOnRestore(): Prom
   try {
     const envPath = path.join(ctx.cwd, ".env.local");
     await writeFile(envPath, "legacy secret\n", "utf8");
+    const jjStatePath = path.join(ctx.cwd, ".jj", "state");
+    await mkdir(path.dirname(jjStatePath), { recursive: true });
+    await writeFile(jjStatePath, "legacy Jujutsu state\n", "utf8");
     const session = await createSession(ctx);
     captureNotifications(session);
     ctx.provider.setResponses([
@@ -2932,7 +3231,7 @@ async function testLegacyTrackedHardExcludeIsPrunedAndPreservedOnRestore(): Prom
     await session.prompt("create first.txt");
     await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "legacy fixture snapshot was not created");
 
-    await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "add", "-f", "--", ".env.local"), { cwd: ctx.cwd });
+    await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "add", "-f", "--", ".env.local", ".jj/state"), { cwd: ctx.cwd });
     await execFileAsync("git", [
       "-c", "user.name=workspace-history-test",
       "-c", "user.email=workspace-history-test@local",
@@ -2960,11 +3259,14 @@ async function testLegacyTrackedHardExcludeIsPrunedAndPreservedOnRestore(): Prom
       { cwd: ctx.cwd },
     );
     assert.doesNotMatch(trackedAfterUpgrade, /\.env\.local/, "new snapshots must prune hard excludes tracked by older versions");
+    assert.doesNotMatch(trackedAfterUpgrade, /\.jj\//, "new snapshots must prune Jujutsu metadata tracked by older versions");
 
     await writeFile(envPath, "current secret\n", "utf8");
+    await writeFile(jjStatePath, "current Jujutsu state\n", "utf8");
     const navigation = await session.navigateTree(oldSnapshotId, { summarize: false });
     assert.equal(navigation.cancelled, false, "restoring an old snapshot should ignore its hard-excluded files");
     assert.equal(normalizeEol(await readText(envPath)), "current secret\n", "old snapshots must not overwrite hard-excluded files");
+    assert.equal(normalizeEol(await readText(jjStatePath)), "current Jujutsu state\n", "old snapshots must not overwrite Jujutsu metadata");
     await waitForExists(path.join(ctx.cwd, "second.txt"), false, "managed files should still restore to the old snapshot");
     session.dispose();
   } finally {
@@ -3257,7 +3559,7 @@ async function testBranchSnapshotsSurviveGitPrune(): Promise<void> {
 
     await execFileAsync(
       "git",
-      ["--git-dir", gitDir, "update-ref", "-d", `refs/workspace-history/snapshots/${cCommit}`],
+      ["--git-dir", gitDir, "update-ref", "-d", `${SNAPSHOT_RETENTION_REF_PREFIX}/${cCommit}`],
       { cwd: ctx.cwd },
     );
     await pruneUnreachableGitObjects(gitDir, ctx.cwd);
@@ -3295,7 +3597,7 @@ async function testMissingPreviousSnapshotFallsBackToFreshBefore(): Promise<void
     await execFileAsync("git", ["--git-dir", gitDir, "update-ref", headRef, first.beforeCommit], { cwd: ctx.cwd });
     await execFileAsync(
       "git",
-      ["--git-dir", gitDir, "update-ref", "-d", `refs/workspace-history/snapshots/${first.afterCommit}`],
+      ["--git-dir", gitDir, "update-ref", "-d", `${SNAPSHOT_RETENTION_REF_PREFIX}/${first.afterCommit}`],
       { cwd: ctx.cwd },
     );
     await pruneUnreachableGitObjects(gitDir, ctx.cwd);
@@ -3334,7 +3636,7 @@ async function testSessionStartRebuildsSnapshotRetentionRefs(): Promise<void> {
 
     const refs = await execFileAsync(
       "git",
-      ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)", "refs/workspace-history"],
+      ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)", SNAPSHOT_RETENTION_REF_PREFIX],
       { cwd: ctx1.cwd },
     );
     for (const ref of refs.stdout.split(/\r?\n/).filter((value) => value.length > 0)) {
@@ -3346,7 +3648,7 @@ async function testSessionStartRebuildsSnapshotRetentionRefs(): Promise<void> {
     await waitFor(async () => {
       const rebuiltRefs = await execFileAsync(
         "git",
-        ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)", "refs/workspace-history"],
+        ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)", SNAPSHOT_RETENTION_REF_PREFIX],
         { cwd: ctx1.cwd },
       );
       return rebuiltRefs.stdout.includes(turn.beforeCommit) && rebuiltRefs.stdout.includes(turn.afterCommit);
@@ -3367,6 +3669,11 @@ async function main(): Promise<void> {
     { name: "session start does not create baseline eagerly", run: testSessionStartDoesNotCreateBaselineEagerly },
     { name: "idle warmup is reused by first turn", run: testIdleWarmupIsReusedByFirstTurn },
     { name: "non-project workspace disables extension", run: testNonProjectWorkspaceDisablesExtension },
+    { name: "Jujutsu-only workspace preserves metadata", run: testJujutsuOnlyWorkspacePreservesMetadata },
+    { name: "Jujutsu metadata directory disables workspace history", run: testJujutsuMetadataDirectoryDisablesExtension },
+    { name: "Git repository metadata remains untouched", run: testGitRepositoryMetadataRemainsUntouched },
+    { name: "concurrent Pi sessions preserve Jujutsu edits", run: testConcurrentSessionsInJujutsuWorkspace },
+    { name: "colocated repository metadata remains untouched", run: testColocatedRepositoryMetadataRemainsUntouched },
     { name: "internal storageDir disables extension", run: testInternalStorageDirDisablesExtension },
     { name: "project marker requirement can be disabled", run: testProjectMarkerRequirementCanBeDisabled },
     { name: "ancestor project markers enable subdirectories", run: testAncestorProjectMarkersEnableSubdirectories },

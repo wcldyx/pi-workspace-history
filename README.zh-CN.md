@@ -106,19 +106,24 @@
 
 插件内部使用独立的 shadow git 来保存快照，而不是依赖用户项目本身的 `.git` 历史。
 
+同一套文件历史流程可用于 Git 仓库、Jujutsu 仓库以及 Git/Jujutsu colocated 仓库。仓库元数据（`.git/` 和 `.jj/`）不会进入快照，也不会被恢复。因此，工作区撤销只恢复文件内容，不会回退 Git 的 commit、branch 或 index，也不会回退 Jujutsu 的 commit、bookmark 或 operation。撤销后，`git status` 或 `jj status` 可能会把恢复的文件显示为工作区修改；如需回退仓库历史，请使用对应 VCS 自身的恢复命令。
+
+即使工作区只使用 Jujutsu，扩展仍需要 Git 可执行文件来维护私有 shadow 仓库。
+
 一个撤销单元从原始 prompt 开始，直到 Pi 报告 Agent 已 settled 为止。中间工具轮次各自拥有 `/tree` 锚点，但排队输入不会替换该操作最初的 prompt 或 `before` 快照。因此，一次 `/undo` 会完整撤销多轮工具调用的全部结果，`/redo` 也会把它作为整体恢复。
 
 只回退对话且不生成分支摘要时，插件会先处理此前中断恢复留下的待恢复工作；如果中断恢复后文件又被修改，这些后续修改会自动保留。随后插件快照当前文件，并将其作为后续历史分支的起点。继续对话后，分支中正常可见的消息节点即可通过 `/tree` 恢复这份保留的工作区状态。取消选择时，对话和工作区都不改变；非交互模式继续沿用原来的“对话和工作区一起恢复”行为。
 
 默认快照范围：
 
-- Git tracked 文件
-- 未被 ignore 的 untracked 文件
+- 已由内部 shadow 仓库纳管的文件
+- 未被 ignore 的新文件
 - 命中工作区 `.gitignore` 的路径会被过滤掉，即使它们此前已经进入过快照范围
 
 默认排除：
 
 - `.git/`
+- `.jj/`
 - `.pi/workspace-history/`
 - `node_modules/`
 - `dist/`
@@ -179,11 +184,13 @@
   - 是否允许在用户 home 目录启用
   - 默认：`false`
 - `workspaceHistory.requireProjectMarker`
-  - 是否要求当前目录或祖先目录存在 `.git`、`package.json`、`Cargo.toml`、`go.mod`、`pyproject.toml` 等项目标记
+  - 是否要求当前目录或祖先目录存在 `.git`、`.jj`、`package.json`、`Cargo.toml`、`go.mod`、`pyproject.toml` 等项目标记
   - 默认：`true`
   - 设为 `false` 时，自动模式允许文件系统根目录和用户 home 目录以外的任意目录（home 目录仍需同时启用 `allowHomeDirectory`）
-- `workspaceHistory.maxScanFiles` / `workspaceHistory.maxScanDirs` / `workspaceHistory.maxScanMs`
-  - 工作区扫描的安全预算
+- `workspaceHistory.maxScanFiles`
+- `workspaceHistory.maxScanDirs`
+- `workspaceHistory.maxScanMs`
+  - 恢复时扫描工作区的安全限制
 - `workspaceHistory.gitTimeoutMs`
   - 插件内部 git 操作超时时间
 
@@ -237,6 +244,7 @@ npm run typecheck
 
 ## 最近更新
 
+- Git、Jujutsu 和 colocated 仓库共用同一套文件历史流程，同时保持各自的 VCS 元数据不变
 - 完整的多轮 Agent 操作现在作为一个 undo / redo 单元
 - 即使 `.gitignore` 使用反向规则，硬排除路径也不会重新被纳管
 - Git、Rust、Go、Python 等项目标记可从祖先目录识别
