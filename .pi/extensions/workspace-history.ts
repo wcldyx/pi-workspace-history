@@ -10,6 +10,7 @@ import {
   access,
   appendFile,
   mkdir,
+  opendir,
   readFile,
   realpath,
   rename,
@@ -38,6 +39,10 @@ const SHADOW_REPO_LOCK_WAIT_MS = 5_000;
 const SHADOW_REPO_LOCK_STALE_MS = 15_000;
 const RESTORE_FILE_LOCK_RETRY_DELAYS_MS = [100, 250, 500] as const;
 const WORKSPACE_HISTORY_LOG_ENV = "PI_WORKSPACE_HISTORY_LOG";
+const MULTI_REPO_SCAN_MAX_DIRS = 256;
+const MULTI_REPO_SCAN_MAX_MS = 250;
+const MULTI_REPO_SCAN_BATCH_SIZE = 16;
+const MULTI_REPO_SCAN_CACHE_MS = 30_000;
 const PROJECT_MARKER_FILES = [
   ".git",
   ".jj",
@@ -56,6 +61,7 @@ const PROJECT_MARKER_FILES = [
 type SnapshotKind = "baseline" | "before" | "after" | "manual";
 type WorkspaceComparison = "clean" | "dirty" | "missing";
 type NavigationMode = "conversationAndWorkspace" | "conversationOnly";
+type MultiRepoScanOutcome = "not-container" | "container" | "time-limit" | "directory-limit" | "error";
 
 const NAVIGATION_MODE_OPTIONS = [
   "Conversation and workspace",
@@ -123,6 +129,13 @@ interface PendingRecoveryState {
   createdAt: string;
 }
 
+interface MultiRepoContainerCache {
+  cwd: string;
+  rootMtimeMs: number;
+  checkedAt: number;
+  isContainer: boolean;
+}
+
 interface RuntimeState {
   pendingTurnId?: string;
   pendingBeforeCommit?: string;
@@ -169,6 +182,7 @@ interface RuntimeState {
   validatedShadowGitDir?: string;
   warnedMissingSnapshotCommits?: Set<string>;
   sessionLeaseOwnerId?: string;
+  multiRepoContainerCache?: MultiRepoContainerCache;
 }
 
 interface NavigationPrecheckResult {
@@ -418,25 +432,133 @@ async function isInsideJujutsuMetadata(cwd: string): Promise<boolean> {
   }
 }
 
-async function isMultiRepoContainer(cwd: string): Promise<boolean> {
+async function countRepositoryRoots(directoryPaths: string[], deadline: number): Promise<number | undefined> {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) {
+    return undefined;
+  }
+
   try {
-    const entries = await readdir(cwd, { withFileTypes: true });
-    let repoCount = 0;
-    for (const entry of entries) {
-      if (entry.isDirectory() && !entry.name.startsWith(".")) {
-        const subDir = path.join(cwd, entry.name);
-        if (await pathExists(path.join(subDir, ".git")) || await pathExists(path.join(subDir, ".jj"))) {
-          repoCount++;
-          if (repoCount >= 2) {
-            return true;
-          }
+    const markers = await withTimeout(
+      Promise.all(directoryPaths.map(async (directoryPath) => {
+        const [hasGit, hasJujutsu] = await Promise.all([
+          pathExists(path.join(directoryPath, ".git")),
+          pathExists(path.join(directoryPath, ".jj")),
+        ]);
+        return hasGit || hasJujutsu;
+      })),
+      remainingMs,
+      "multi-repo marker scan",
+    );
+    return markers.filter(Boolean).length;
+  } catch {
+    return undefined;
+  }
+}
+
+async function isMultiRepoContainer(
+  ctx: ExtensionContext,
+  cwd: string,
+  state?: RuntimeState,
+): Promise<boolean> {
+  const normalizedCwd = normalizePathForComparison(cwd);
+  const rootStat = await stat(cwd).catch(() => undefined);
+  if (!rootStat?.isDirectory()) {
+    return false;
+  }
+
+  const now = Date.now();
+  const cached = state?.multiRepoContainerCache;
+  if (
+    cached &&
+    cached.cwd === normalizedCwd &&
+    cached.rootMtimeMs === rootStat.mtimeMs &&
+    now - cached.checkedAt < MULTI_REPO_SCAN_CACHE_MS
+  ) {
+    return cached.isContainer;
+  }
+
+  const startedAt = now;
+  const deadline = startedAt + MULTI_REPO_SCAN_MAX_MS;
+  const pendingDirectories: string[] = [];
+  let checkedDirs = 0;
+  let repoCount = 0;
+  let outcome: MultiRepoScanOutcome = "not-container";
+
+  const openPromise = opendir(cwd);
+  const directory = await withTimeout(
+    openPromise,
+    Math.max(1, deadline - Date.now()),
+    "multi-repo directory open",
+  ).catch(() => undefined);
+  if (!directory) {
+    outcome = Date.now() >= deadline ? "time-limit" : "error";
+    void openPromise.then((lateDirectory) => lateDirectory.close()).catch(() => undefined);
+  }
+
+  try {
+    for await (const entry of directory ?? []) {
+      if (Date.now() >= deadline) {
+        outcome = "time-limit";
+        break;
+      }
+      if (!entry.isDirectory() || entry.name.startsWith(".")) {
+        continue;
+      }
+      if (checkedDirs >= MULTI_REPO_SCAN_MAX_DIRS) {
+        outcome = "directory-limit";
+        break;
+      }
+
+      checkedDirs++;
+      pendingDirectories.push(path.join(cwd, entry.name));
+      if (pendingDirectories.length < MULTI_REPO_SCAN_BATCH_SIZE) {
+        continue;
+      }
+
+      const found = await countRepositoryRoots(pendingDirectories, deadline);
+      pendingDirectories.length = 0;
+      if (found === undefined) {
+        outcome = "time-limit";
+        break;
+      }
+      repoCount += found;
+      if (repoCount >= 2) {
+        outcome = "container";
+        break;
+      }
+    }
+
+    if (outcome === "not-container" && pendingDirectories.length > 0) {
+      const found = await countRepositoryRoots(pendingDirectories, deadline);
+      if (found === undefined) {
+        outcome = "time-limit";
+      } else {
+        repoCount += found;
+        if (repoCount >= 2) {
+          outcome = "container";
         }
       }
     }
   } catch {
-    return false;
+    outcome = "error";
   }
-  return false;
+
+  const isContainer = outcome === "container";
+  if (state) {
+    state.multiRepoContainerCache = {
+      cwd: normalizedCwd,
+      rootMtimeMs: rootStat.mtimeMs,
+      checkedAt: Date.now(),
+      isContainer,
+    };
+  }
+  await logLine(
+    ctx,
+    `multi-repo scan done ${elapsedMs(startedAt)}ms outcome=${outcome} checkedDirs=${checkedDirs} repoCount=${repoCount}`,
+    state,
+  ).catch(() => undefined);
+  return isContainer;
 }
 
 function normalizePathForComparison(filePath: string): string {
@@ -538,8 +660,8 @@ async function evaluateWorkspaceHistoryAvailability(ctx: ExtensionContext, state
       availability = { enabled: false, reason: "current directory is a filesystem root" };
     } else if (settings.requireProjectMarker && !(await hasProjectMarker(resolvedCwd))) {
       availability = { enabled: false, reason: "no project marker found" };
-    } else if (!(await pathExists(path.join(resolvedCwd, ".git"))) && !(await pathExists(path.join(resolvedCwd, ".jj"))) && (await isMultiRepoContainer(resolvedCwd))) {
-      availability = { enabled: false, reason: "workspace is a multi-repo container without root git" };
+    } else if (settings.requireProjectMarker && !(await pathExists(path.join(resolvedCwd, ".git"))) && !(await pathExists(path.join(resolvedCwd, ".jj"))) && (await isMultiRepoContainer(ctx, resolvedCwd, state))) {
+      availability = { enabled: false, reason: "workspace is a multi-repo container without a root repository" };
     } else {
       availability = { enabled: true };
     }
@@ -2992,6 +3114,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.validatedShadowGitDir = undefined;
     state.warnedMissingSnapshotCommits = undefined;
     state.sessionLeaseOwnerId = undefined;
+    state.multiRepoContainerCache = undefined;
 
     if (!await ensureWorkspaceHistoryAvailable(ctx, state, "session_start")) {
       return;
