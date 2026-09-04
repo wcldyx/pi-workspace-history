@@ -178,7 +178,9 @@ Settings:
   - Default: `10`
 - `workspaceHistory.enabled`
   - `auto` (default) enables the plugin when the current directory or an ancestor contains a declared project marker
-  - `true` forces it on
+  - In automatic mode with project markers required, a directory without its own `.git` or `.jj` is skipped when at least two immediate non-hidden child directories are repositories
+  - This multi-repo container check is shallow and bounded; if it cannot finish confidently, workspace history stays enabled
+  - `true` forces it on, including for multi-repo container directories
   - `false` disables it completely
 - `workspaceHistory.allowHomeDirectory`
   - Allow enabling in the user home directory
@@ -186,7 +188,7 @@ Settings:
 - `workspaceHistory.requireProjectMarker`
   - Require a project marker such as `.git`, `.jj`, `package.json`, `Cargo.toml`, `go.mod`, or `pyproject.toml` in the current directory or an ancestor
   - Default: `true`
-  - When `false`, automatic mode accepts any directory except a filesystem root or the user home directory (unless `allowHomeDirectory` is also enabled)
+  - When `false`, automatic mode accepts any directory except a filesystem root or the user home directory (unless `allowHomeDirectory` is also enabled), and skips multi-repo container detection
 - `workspaceHistory.maxScanFiles`
 - `workspaceHistory.maxScanDirs`
 - `workspaceHistory.maxScanMs`

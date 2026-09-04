@@ -34,6 +34,9 @@ type TestContext = {
   provider: ReturnType<typeof fauxProvider> & { unregister(): void };
 };
 
+type TestSession = Awaited<ReturnType<typeof createAgentSession>>["session"];
+type TestUIContext = Parameters<TestSession["extensionRunner"]["setUIContext"]>[0];
+
 type TurnSnapshotState = {
   version: 1;
   turns: Array<{
@@ -166,6 +169,22 @@ async function createNonProjectContext(): Promise<TestContext> {
   return createContextForWorkspace(rootDir, cwd, false);
 }
 
+async function initializeGitRepository(repoDir: string): Promise<void> {
+  await mkdir(repoDir, { recursive: true });
+  await execFileAsync("git", ["init", "--quiet", repoDir]);
+  await writeFile(path.join(repoDir, "tracked.txt"), "tracked\n", "utf8");
+  await execFileAsync("git", ["-C", repoDir, "add", "tracked.txt"]);
+  await execFileAsync(
+    "git",
+    ["-C", repoDir, "-c", "user.name=workspace-history-test", "-c", "user.email=test@example.invalid", "commit", "--quiet", "-m", "initial"],
+  );
+}
+
+async function initializeEmptyGitRepository(repoDir: string): Promise<void> {
+  await mkdir(repoDir, { recursive: true });
+  await execFileAsync("git", ["init", "--quiet", repoDir]);
+}
+
 async function writeWorkspaceHistorySettings(
   ctx: TestContext,
   workspaceHistory: Record<string, unknown>,
@@ -187,7 +206,11 @@ async function disposeContext(ctx: TestContext): Promise<void> {
   });
 }
 
-async function createSession(ctx: TestContext, sessionManager: SessionManager = SessionManager.inMemory(ctx.cwd)) {
+async function createSession(
+  ctx: TestContext,
+  sessionManager: SessionManager = SessionManager.inMemory(ctx.cwd),
+  uiContext?: TestUIContext,
+) {
   const model = ctx.provider.getModel();
   const result = await createAgentSession({
     cwd: ctx.cwd,
@@ -203,6 +226,7 @@ async function createSession(ctx: TestContext, sessionManager: SessionManager = 
 
   const session = result.session;
   await session.bindExtensions({
+    uiContext,
     commandContextActions: {
       waitForIdle: () => session.agent.waitForIdle(),
       newSession: async () => ({ cancelled: true }),
@@ -452,7 +476,10 @@ async function holdWindowsFileWithoutDeleteSharing(
   try {
     await new Promise<void>((resolve, reject) => {
       let stdout = "";
-      const timeout = setTimeout(() => reject(new Error("timed out waiting for the Windows file lock helper")), 5_000);
+      const timeout = setTimeout(
+        () => reject(new Error("timed out waiting for the Windows file lock helper")),
+        ASYNC_ASSERTION_TIMEOUT_MS,
+      );
       child.stdout.on("data", (chunk) => {
         stdout += chunk.toString();
         if (!ready && stdout.includes("READY")) {
@@ -641,7 +668,29 @@ function configureTestUI(
     notifications: [],
     selections: [],
   };
-  type UIContext = Parameters<typeof session.extensionRunner.setUIContext>[0];
+  session.extensionRunner.setUIContext(createTestUIContext(state, choices, selectFirstByDefault));
+  return state;
+}
+
+async function withWorkspaceHistoryLogging<T>(run: () => Promise<T>): Promise<T> {
+  const previousLogging = process.env.PI_WORKSPACE_HISTORY_LOG;
+  process.env.PI_WORKSPACE_HISTORY_LOG = "1";
+  try {
+    return await run();
+  } finally {
+    if (previousLogging === undefined) {
+      delete process.env.PI_WORKSPACE_HISTORY_LOG;
+    } else {
+      process.env.PI_WORKSPACE_HISTORY_LOG = previousLogging;
+    }
+  }
+}
+
+function createTestUIContext(
+  state: TestUIState,
+  choices: string[],
+  selectFirstByDefault = false,
+): TestUIContext {
   const uiContext = new Proxy({
     async select(title: string, options: string[]): Promise<string | undefined> {
       state.selections.push({ title, options: [...options] });
@@ -657,9 +706,8 @@ function configureTestUI(
     get(target, property) {
       return Reflect.get(target, property) ?? (() => undefined);
     },
-  }) as UIContext;
-  session.extensionRunner.setUIContext(uiContext);
-  return state;
+  }) as TestUIContext;
+  return uiContext;
 }
 
 async function testUndoConversationOnlyKeepsWorkspace(): Promise<void> {
@@ -2652,6 +2700,276 @@ async function testProjectMarkerRequirementCanBeDisabled(): Promise<void> {
   }
 }
 
+async function testProjectMarkerOverrideAllowsMultiRepoContainers(): Promise<void> {
+  const ctx = await createNonProjectContext();
+  try {
+    await initializeGitRepository(path.join(ctx.cwd, "repo-a"));
+    await initializeGitRepository(path.join(ctx.cwd, "repo-b"));
+    await writeWorkspaceHistorySettings(ctx, {
+      storageDir: getWorkspaceHistoryStateDir(ctx.rootDir),
+      requireProjectMarker: false,
+    });
+    const session = await createSession(ctx);
+    const notifications = captureNotifications(session);
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "markerless.txt", content: "enabled\n" })]),
+      fauxAssistantMessage("enabled markerless history"),
+    ]);
+
+    await session.prompt("create markerless.txt");
+
+    assert.equal(
+      notifications.some((message) => message.includes("multi-repo container")),
+      false,
+      "requireProjectMarker=false should not auto-disable a multi-repo container",
+    );
+    await waitFor(
+      async () => await countSnapshots(session, ctx.cwd, "after") >= 1,
+      "requireProjectMarker=false should keep workspace history enabled for a multi-repo container",
+    );
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testMultiRepoContainerDisablesWorkspaceHistory(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    await initializeGitRepository(path.join(ctx.cwd, "repo-a"));
+    await initializeEmptyGitRepository(path.join(ctx.cwd, "repo-empty"));
+    const uiState: TestUIState = { notifications: [], selections: [] };
+    const session = await createSession(ctx, undefined, createTestUIContext(uiState, [], true));
+    const notifications = uiState.notifications;
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "first.txt", content: "first\n" })]),
+      fauxAssistantMessage("created first file"),
+    ]);
+
+    await session.prompt("create first.txt");
+    await waitForExists(path.join(ctx.cwd, "first.txt"), true, "the agent should still edit files when history is disabled");
+    assert.equal(await countSnapshots(session, ctx.cwd), 0, "a multi-repo container must not create snapshots");
+    assert.equal(
+      await pathExists(getWorkspaceHistoryStateDir(ctx.rootDir)),
+      false,
+      "a disabled multi-repo container must not create workspace history storage",
+    );
+    assert.equal(
+      notifications.filter((message) => message.includes("multi-repo container without a root repository")).length,
+      1,
+      "a multi-repo container should show one actionable warning",
+    );
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "second.txt", content: "second\n" })]),
+      fauxAssistantMessage("created second file"),
+    ]);
+    await session.prompt("create second.txt");
+
+    assert.equal(await countSnapshots(session, ctx.cwd), 0, "later turns must remain unsnapshotted in a multi-repo container");
+    assert.equal(
+      notifications.filter((message) => message.includes("multi-repo container without a root repository")).length,
+      1,
+      "the disabled warning should not repeat on later turns",
+    );
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testMixedGitAndJujutsuChildrenDisableWorkspaceHistory(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    await initializeGitRepository(path.join(ctx.cwd, "git-project"));
+    await mkdir(path.join(ctx.cwd, "jj-project", ".jj"), { recursive: true });
+    const session = await createSession(ctx);
+    ctx.provider.setResponses([fauxAssistantMessage("no file changes")]);
+
+    await session.prompt("answer without changing files");
+
+    assert.equal(
+      await countSnapshots(session, ctx.cwd),
+      0,
+      "Git and Jujutsu child repositories together should identify a multi-repo container",
+    );
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testSingleChildRepositoryKeepsWorkspaceHistoryEnabled(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    await initializeGitRepository(path.join(ctx.cwd, "repo-a"));
+    const session = await createSession(ctx);
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "managed.txt", content: "managed\n" })]),
+      fauxAssistantMessage("created managed file"),
+    ]);
+
+    await session.prompt("create managed.txt");
+
+    await waitFor(
+      async () => await countSnapshots(session, ctx.cwd, "after") >= 1,
+      "one child repository should not disable workspace history",
+    );
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testRootRepositoryKeepsMultiRepoWorkspaceEnabled(): Promise<void> {
+  for (const marker of [".git", ".jj"] as const) {
+    const ctx = await createContext();
+    try {
+      if (marker === ".git") {
+        await execFileAsync("git", ["init", "--quiet", ctx.cwd]);
+      } else {
+        await mkdir(path.join(ctx.cwd, marker));
+      }
+      await initializeGitRepository(path.join(ctx.cwd, "repo-a"));
+      await initializeGitRepository(path.join(ctx.cwd, "repo-b"));
+      const session = await createSession(ctx);
+      ctx.provider.setResponses([
+        fauxAssistantMessage([fauxToolCall("write", { path: "managed.txt", content: `${marker}\n` })]),
+        fauxAssistantMessage("created managed file"),
+      ]);
+
+      await session.prompt("create managed.txt");
+
+      await waitFor(
+        async () => await countSnapshots(session, ctx.cwd, "after") >= 1,
+        `a root ${marker} repository should keep workspace history enabled`,
+      );
+      session.dispose();
+    } finally {
+      await disposeContext(ctx);
+    }
+  }
+}
+
+async function testForcedEnableAllowsMultiRepoContainers(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    await initializeGitRepository(path.join(ctx.cwd, "repo-a"));
+    await initializeGitRepository(path.join(ctx.cwd, "repo-b"));
+    await writeWorkspaceHistorySettings(ctx, {
+      storageDir: getWorkspaceHistoryStateDir(ctx.rootDir),
+      enabled: true,
+    });
+    const session = await createSession(ctx);
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "forced.txt", content: "forced\n" })]),
+      fauxAssistantMessage("created forced file"),
+    ]);
+
+    await session.prompt("create forced.txt");
+
+    await waitFor(
+      async () => await countSnapshots(session, ctx.cwd, "after") >= 1,
+      "enabled=true should force workspace history on in a multi-repo container",
+    );
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testMultiRepoContainerScanIsCached(): Promise<void> {
+  await withWorkspaceHistoryLogging(async () => {
+    const ctx = await createContext();
+    try {
+      await initializeGitRepository(path.join(ctx.cwd, "repo-a"));
+      await initializeGitRepository(path.join(ctx.cwd, "repo-b"));
+      const session = await createSession(ctx);
+      ctx.provider.setResponses([fauxAssistantMessage("no file changes")]);
+
+      await session.prompt("answer without changing files");
+
+      const logPath = path.join(getWorkspaceHistoryStateDir(ctx.rootDir), "logs", "timemachine.log");
+      await waitForExists(logPath, true, "diagnostic log should be created");
+      const logText = await readText(logPath);
+      assert.equal(
+        logText.split("\n").filter((line) => line.includes("multi-repo scan done")).length,
+        1,
+        "repeated agent events should reuse one multi-repo scan result",
+      );
+      await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      session.dispose();
+    } finally {
+      await disposeContext(ctx);
+    }
+  });
+}
+
+async function testMultiRepoContainerScanIsBounded(): Promise<void> {
+  await withWorkspaceHistoryLogging(async () => {
+    const ctx = await createContext();
+    try {
+      await Promise.all(Array.from({ length: 300 }, (_, index) => {
+        return mkdir(path.join(ctx.cwd, `directory-${String(index).padStart(3, "0")}`));
+      }));
+      const session = await createSession(ctx);
+      ctx.provider.setResponses([fauxAssistantMessage("no file changes")]);
+
+      await session.prompt("answer without changing files");
+
+      await waitFor(
+        async () => await countSnapshots(session, ctx.cwd, "after") >= 1,
+        "an inconclusive bounded scan should leave workspace history enabled",
+      );
+      const logPath = path.join(getWorkspaceHistoryStateDir(ctx.rootDir), "logs", "timemachine.log");
+      const logText = await readText(logPath);
+      const scanMatch = logText.match(
+        /multi-repo scan done .* outcome=(directory-limit|time-limit) checkedDirs=(\d+) repoCount=0/,
+      );
+      assert.ok(scanMatch, "the multi-repo scan should stop at a configured safety limit");
+      assert.ok(Number(scanMatch[2]) <= 256, "the multi-repo scan must not inspect more than 256 directories");
+      await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      session.dispose();
+    } finally {
+      await disposeContext(ctx);
+    }
+  });
+}
+
+async function testMultiRepoContainerCacheInvalidatesAfterDirectoryChange(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    await initializeGitRepository(path.join(ctx.cwd, "repo-a"));
+    const session = await createSession(ctx);
+    const notifications = captureNotifications(session);
+    ctx.provider.setResponses([fauxAssistantMessage("first turn")]);
+
+    await session.prompt("complete the first turn without changing files");
+    await waitFor(
+      async () => await countSnapshots(session, ctx.cwd, "after") === 1,
+      "one child repository should allow the first snapshot",
+    );
+
+    await initializeGitRepository(path.join(ctx.cwd, "repo-b"));
+    ctx.provider.setResponses([fauxAssistantMessage("second turn")]);
+    await session.prompt("complete the second turn without changing files");
+
+    assert.equal(
+      await countSnapshots(session, ctx.cwd, "after"),
+      1,
+      "adding a second child repository should invalidate the cache and stop new snapshots",
+    );
+    assert.equal(
+      notifications.filter((message) => message.includes("multi-repo container without a root repository")).length,
+      1,
+      "the newly detected multi-repo container should show one warning",
+    );
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
 async function testAncestorProjectMarkersEnableSubdirectories(): Promise<void> {
   const markers = [".git", "Cargo.toml", "go.mod", "pyproject.toml"];
   for (const marker of markers) {
@@ -3676,6 +3994,15 @@ async function main(): Promise<void> {
     { name: "colocated repository metadata remains untouched", run: testColocatedRepositoryMetadataRemainsUntouched },
     { name: "internal storageDir disables extension", run: testInternalStorageDirDisablesExtension },
     { name: "project marker requirement can be disabled", run: testProjectMarkerRequirementCanBeDisabled },
+    { name: "project marker override allows multi-repo containers", run: testProjectMarkerOverrideAllowsMultiRepoContainers },
+    { name: "multi-repo container disables workspace history", run: testMultiRepoContainerDisablesWorkspaceHistory },
+    { name: "mixed Git and Jujutsu children disable workspace history", run: testMixedGitAndJujutsuChildrenDisableWorkspaceHistory },
+    { name: "single child repository keeps workspace history enabled", run: testSingleChildRepositoryKeepsWorkspaceHistoryEnabled },
+    { name: "root repository keeps multi-repo workspace enabled", run: testRootRepositoryKeepsMultiRepoWorkspaceEnabled },
+    { name: "forced enable allows multi-repo containers", run: testForcedEnableAllowsMultiRepoContainers },
+    { name: "multi-repo container scan is cached", run: testMultiRepoContainerScanIsCached },
+    { name: "multi-repo container scan is bounded", run: testMultiRepoContainerScanIsBounded },
+    { name: "multi-repo container cache invalidates after directory change", run: testMultiRepoContainerCacheInvalidatesAfterDirectoryChange },
     { name: "ancestor project markers enable subdirectories", run: testAncestorProjectMarkersEnableSubdirectories },
     { name: "conversation-only undo keeps workspace", run: testUndoConversationOnlyKeepsWorkspace },
     { name: "redo reuses conversation-only undo mode", run: testRedoReusesConversationOnlyMode },

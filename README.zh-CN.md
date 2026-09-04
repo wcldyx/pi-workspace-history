@@ -178,7 +178,9 @@
   - 默认：`10`
 - `workspaceHistory.enabled`
   - `auto`（默认）在当前目录或祖先目录存在已声明项目标记时启用
-  - `true` 强制启用
+  - 自动模式且要求项目标记时，如果当前目录自身没有 `.git` 或 `.jj`，但至少两个直属非隐藏子目录是仓库，则插件会跳过该多仓库容器目录
+  - 多仓库容器检查是浅层且有界的；无法可靠完成判断时，workspace-history 继续启用
+  - `true` 强制启用，包括多仓库容器目录
   - `false` 完全禁用
 - `workspaceHistory.allowHomeDirectory`
   - 是否允许在用户 home 目录启用
@@ -186,7 +188,7 @@
 - `workspaceHistory.requireProjectMarker`
   - 是否要求当前目录或祖先目录存在 `.git`、`.jj`、`package.json`、`Cargo.toml`、`go.mod`、`pyproject.toml` 等项目标记
   - 默认：`true`
-  - 设为 `false` 时，自动模式允许文件系统根目录和用户 home 目录以外的任意目录（home 目录仍需同时启用 `allowHomeDirectory`）
+  - 设为 `false` 时，自动模式允许文件系统根目录和用户 home 目录以外的任意目录（home 目录仍需同时启用 `allowHomeDirectory`），并跳过多仓库容器判断
 - `workspaceHistory.maxScanFiles`
 - `workspaceHistory.maxScanDirs`
 - `workspaceHistory.maxScanMs`
