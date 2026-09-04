@@ -476,7 +476,10 @@ async function holdWindowsFileWithoutDeleteSharing(
   try {
     await new Promise<void>((resolve, reject) => {
       let stdout = "";
-      const timeout = setTimeout(() => reject(new Error("timed out waiting for the Windows file lock helper")), 5_000);
+      const timeout = setTimeout(
+        () => reject(new Error("timed out waiting for the Windows file lock helper")),
+        ASYNC_ASSERTION_TIMEOUT_MS,
+      );
       child.stdout.on("data", (chunk) => {
         stdout += chunk.toString();
         if (!ready && stdout.includes("READY")) {
