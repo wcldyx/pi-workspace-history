@@ -2725,6 +2725,41 @@ async function ensureNoUnsnapshottedChanges(
   return { currentLeafId, currentSnapshot };
 }
 
+type TreeWorkspaceComparison = "identical" | "different" | "dirty" | "unknown";
+
+async function compareTreeWorkspace(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  targetId: string,
+  state: RuntimeState,
+): Promise<TreeWorkspaceComparison> {
+  const currentId = ctx.sessionManager.getLeafId();
+  const current = getResolvedSnapshotData(currentId ? resolveSnapshotForTreeTarget(ctx, currentId, state) : undefined);
+  const target = getResolvedSnapshotData(resolveSnapshotForTreeTarget(ctx, targetId, state));
+  if (!current || !target) {
+    return "unknown";
+  }
+  try {
+    if (!await isSnapshotCommitAvailable(pi, ctx, current.commit, state)
+      || !await isSnapshotCommitAvailable(pi, ctx, target.commit, state)) {
+      return "unknown";
+    }
+    const comparison = await isWorkspaceDirtyAgainstCommit(pi, ctx, current.commit, state);
+    if (comparison !== "clean") {
+      return comparison === "dirty" ? "dirty" : "unknown";
+    }
+    const changedPaths = current.commit === target.commit ? [] : parseNullSeparatedPaths(await execGit(
+      pi,
+      ctx,
+      await gitArgs(ctx, state, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", current.commit, target.commit, "--", "."),
+    ));
+    return (await filterSnapshotPaths(ctx, changedPaths, state)).length === 0 ? "identical" : "different";
+  } catch (error) {
+    await logLine(ctx, `tree workspace comparison unavailable target=${targetId} error=${String(error)}`, state);
+    return "unknown";
+  }
+}
+
 async function selectNavigationMode(
   ctx: ExtensionContext,
   title: string,
@@ -3290,7 +3325,32 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       return { cancel: true as const };
     };
 
-    const navigationMode = state.navigationMode ?? await selectNavigationMode(ctx, "Tree navigation", event.signal);
+    let navigationMode = state.navigationMode;
+    if (!navigationMode) {
+      const canCompare = ctx.hasUI && !state.internalNavigation && !event.preparation.userWantsSummary
+        && !state.pendingRecovery && !state.pendingRecoveryPromise && !state.pendingTurnId;
+      const comparison = canCompare
+        ? await compareTreeWorkspace(pi, ctx, event.preparation.targetId, state)
+        : undefined;
+      if (canCompare && event.signal.aborted) {
+        return { cancel: true };
+      }
+      if (comparison === "identical") {
+        // Keep files in place even if an external edit arrives after comparison.
+        // The existing conversation-only path captures and anchors that state.
+        navigationMode = "conversationOnly";
+        await logLine(ctx, `tree navigation skips choice: managed files identical target=${event.preparation.targetId}`, state);
+      } else {
+        const title = comparison === "different"
+          ? "Tree navigation — target files differ"
+          : comparison === "dirty"
+            ? "Tree navigation — current files have unsnapshotted changes"
+            : comparison === "unknown"
+              ? "Tree navigation — file changes could not be determined"
+              : "Tree navigation";
+        navigationMode = await selectNavigationMode(ctx, title, event.signal);
+      }
+    }
     if (!navigationMode) {
       await logLine(ctx, "session_before_tree cancelled: no navigation mode selected", state);
       return { cancel: true };

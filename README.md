@@ -87,6 +87,8 @@ This plugin is built around the following concrete requirements:
   - Protect manual changes before the next prompt is sent
 
 - Workspace restore through `/tree`
+  - When the current and target snapshots are available, current managed files have no unsnapshotted changes, and both snapshots contain the same managed files, navigation skips the mode choice and keeps files in place while anchoring them to the new branch. A clean workspace alone does not mean an older snapshot has the same files.
+  - Otherwise the choice remains; ordinary interactive tree navigation explains whether target files differ, current files have unsnapshotted changes, or the comparison could not be completed. Branch summaries and pending recovery keep their existing flow.
   - Choose whether to restore the matching workspace state after selecting a history node
   - Applies to `/tree` and Pi's double-Escape tree shortcut
   - Supports moving between historical branches

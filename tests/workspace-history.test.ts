@@ -85,7 +85,7 @@ async function getJujutsuOperationId(cwd: string): Promise<string> {
 
 const ASYNC_ASSERTION_TIMEOUT_MS = 15_000;
 
-async function createContextForWorkspace(rootDir: string, cwd: string, withProjectMarker = true): Promise<TestContext> {
+async function createContextForWorkspace(rootDir: string, cwd: string, withProjectMarker = true, extensionFactory?: typeof workspaceHistoryExtension): Promise<TestContext> {
   const resolvedCwd = await realpath(cwd).catch(() => path.resolve(cwd));
   workspaceHashByCwd.set(
     path.normalize(cwd),
@@ -127,7 +127,8 @@ async function createContextForWorkspace(rootDir: string, cwd: string, withProje
     cwd,
     agentDir: getAgentDir(),
     settingsManager,
-    additionalExtensionPaths: [path.join(process.cwd(), ".pi", "extensions", "workspace-history.ts")],
+    additionalExtensionPaths: extensionFactory ? [] : [path.join(process.cwd(), ".pi", "extensions", "workspace-history.ts")],
+    extensionFactories: extensionFactory ? [extensionFactory] : [],
     noSkills: true,
     noPromptTemplates: true,
     noThemes: true,
@@ -155,11 +156,11 @@ async function createContextForWorkspace(rootDir: string, cwd: string, withProje
   };
 }
 
-async function createContext(): Promise<TestContext> {
+async function createContext(extensionFactory?: typeof workspaceHistoryExtension): Promise<TestContext> {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "pi-timemachine-test-"));
   const cwd = path.join(rootDir, "workspace");
   await mkdir(cwd, { recursive: true });
-  return createContextForWorkspace(rootDir, cwd, true);
+  return createContextForWorkspace(rootDir, cwd, true, extensionFactory);
 }
 
 async function createNonProjectContext(): Promise<TestContext> {
@@ -815,7 +816,7 @@ async function testNavigationChoiceCancellationKeepsConversationAndWorkspace(): 
     assert.equal(treeResult.cancelled, true, "cancelled tree choice should cancel navigation");
     assert.equal(session.sessionManager.getLeafId(), originalLeafId);
     assert.equal(normalizeEol(await readText(filePath)), "unchanged\n");
-    assert.deepEqual(treeUI.selections.map(({ title }) => title), ["Tree navigation"]);
+    assert.deepEqual(treeUI.selections.map(({ title }) => title), ["Tree navigation — target files differ"]);
 
     session.dispose();
   } finally {
@@ -871,6 +872,183 @@ async function testConversationOnlyUndoPreservesManualChangesAsBranchState(): Pr
   }
 }
 
+async function testTreeUnchangedFilesSkipChoice(): Promise<void> {
+  const ctx = await createContext();
+  const session = await createSession(ctx);
+  try {
+    ctx.provider.setResponses([fauxAssistantMessage("Hello")]);
+    await session.prompt("Hello");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "after snapshot missing");
+    const target = (await readTurnSnapshots(session, ctx.cwd)).turns[0].userEntryId;
+    const ui = configureTestUI(session, []);
+    const result = await session.navigateTree(target, { summarize: false });
+    assert.equal(ui.selections.length, 0, "identical files should not prompt");
+    assert.equal(result.cancelled, false);
+  } finally {
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
+async function testTreeChoiceSafetyBoundaries(): Promise<void> {
+  const cases = ["equal-commits", "ignored", "legacy-excluded", "changed", "deleted", "renamed", "untracked", "dirty-matches-target", "query-error", "missing-target", "missing-current", "missing-anchor", "capture-error", "late-edit"] as const;
+  for (const scenario of cases) {
+    let navigating = false;
+    let restores = 0;
+    let targetCommit = "";
+    let currentCommit = "";
+    let compared = false;
+    const ctx = await createContext((pi) => {
+      const exec = pi.exec.bind(pi);
+      pi.exec = async (command, args, options) => {
+        if (navigating && command === "git") {
+          if (args.includes("checkout-index")) restores++;
+          if (scenario === "missing-target" && args.includes(`${targetCommit}^{commit}`)) {
+            return { code: 1, stdout: "", stderr: "", killed: false };
+          }
+          if (scenario === "missing-current" && args.includes(`${currentCommit}^{commit}`)) {
+            return { code: 1, stdout: "", stderr: "", killed: false };
+          }
+          if (scenario === "capture-error" && args.includes("update-ref")) {
+            return { code: 128, stdout: "", stderr: "injected snapshot failure", killed: false };
+          }
+          if (args.includes("--name-only")) {
+            compared = true;
+            if (scenario === "query-error") return { code: 128, stdout: "", stderr: "injected comparison failure", killed: false };
+            const result = await exec(command, args, options);
+            if (scenario === "late-edit") await writeFile(path.join(ctx.cwd, "文件.txt"), "late edit\n");
+            return result;
+          }
+        }
+        return exec(command, args, options);
+      };
+      workspaceHistoryExtension(pi);
+    });
+    const session = await createSession(ctx);
+    try {
+      const unanchored = scenario === "missing-anchor" ? session.sessionManager.appendCustomEntry("unanchored", {}) : undefined;
+      const file = path.join(ctx.cwd, "文件.txt");
+      await writeFile(file, "A\n");
+      await writeFile(path.join(ctx.cwd, ".gitignore"), "ignored.txt\n");
+      ctx.provider.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
+      await session.prompt("first");
+      await waitFor(async () => (await readTurnSnapshots(session, ctx.cwd)).turns.length === 1, "first snapshot missing");
+      const first = (await readTurnSnapshots(session, ctx.cwd)).turns[0];
+      let targetId = unanchored ?? first.assistantEntryId;
+      targetCommit = first.afterCommit;
+      if (scenario === "legacy-excluded") {
+        await writeFile(path.join(ctx.cwd, ".env.local"), "legacy secret\n");
+        await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "add", "-f", ".env.local"));
+        await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "legacy secret"));
+        targetCommit = (await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "rev-parse", "HEAD"))).stdout.trim();
+        targetId = session.sessionManager.appendCustomEntry("workspace-history.snapshot", {
+          v: 1, kind: "manual", commit: targetCommit, createdAt: new Date().toISOString(),
+        });
+      }
+      if (["changed", "dirty-matches-target", "query-error", "missing-target"].includes(scenario)) await writeFile(file, "B\n");
+      if (scenario === "deleted" || scenario === "renamed") await rm(file);
+      if (scenario === "renamed") await writeFile(path.join(ctx.cwd, "改名.txt"), "A\n");
+      if (scenario === "equal-commits" || scenario === "late-edit") {
+        await writeFile(file, "temporary\n");
+        ctx.provider.setResponses([
+          fauxAssistantMessage([fauxToolCall("write", { path: "文件.txt", content: "A\n" })]),
+          fauxAssistantMessage("second"),
+        ]);
+      }
+      await session.prompt("second");
+      await waitFor(async () => (await readTurnSnapshots(session, ctx.cwd)).turns.length === 2, "second snapshot missing");
+      currentCommit = (await readTurnSnapshots(session, ctx.cwd)).turns[1].afterCommit;
+      if (scenario === "equal-commits" || scenario === "late-edit") {
+        assert.notEqual((await readTurnSnapshots(session, ctx.cwd)).turns[1].afterCommit, targetCommit);
+      }
+      if (scenario === "dirty-matches-target") await writeFile(file, "A\n");
+      if (scenario === "untracked") await writeFile(path.join(ctx.cwd, "new.txt"), "manual\n");
+      if (scenario === "ignored" || scenario === "legacy-excluded") {
+        await writeFile(path.join(ctx.cwd, ".env.local"), "keep secret\n");
+        await writeFile(path.join(ctx.cwd, "ignored.txt"), "keep ignored\n");
+      }
+      const ui = configureTestUI(session, []);
+      const leaf = session.sessionManager.getLeafId();
+      navigating = true;
+      const result = await session.navigateTree(targetId, { summarize: false });
+      const automatic = ["equal-commits", "ignored", "legacy-excluded", "capture-error", "late-edit"].includes(scenario);
+      assert.equal(ui.selections.length, automatic ? 0 : 1, scenario);
+      assert.equal(result.cancelled, !automatic || scenario === "capture-error", scenario);
+      assert.equal(restores, 0, `must not restore files: ${scenario}`);
+      if (result.cancelled) assert.equal(session.sessionManager.getLeafId(), leaf, scenario);
+      if (scenario === "late-edit") {
+        assert.ok(compared, "race must occur during the real comparison");
+        assert.equal(await readText(file), "late edit\n");
+        assert.equal(await getShadowStatus(session, ctx.cwd), "", "late edit must be anchored");
+      }
+      if (scenario === "ignored" || scenario === "legacy-excluded") {
+        assert.equal(await readText(path.join(ctx.cwd, ".env.local")), "keep secret\n");
+        assert.equal(await readText(path.join(ctx.cwd, "ignored.txt")), "keep ignored\n");
+      }
+      if (["query-error", "missing-target", "missing-current", "missing-anchor"].includes(scenario)) assert.match(ui.selections[0].title, /could not be determined/);
+      if (scenario === "dirty-matches-target" || scenario === "untracked") assert.match(ui.selections[0].title, /unsnapshotted changes/);
+    } finally {
+      session.dispose();
+      await disposeContext(ctx);
+    }
+  }
+}
+
+async function testTreeAutomaticNavigationLifecycle(): Promise<void> {
+  const ctx = await createContext();
+  const session = await createSession(ctx);
+  try {
+    ctx.provider.setResponses([fauxAssistantMessage("Hello")]);
+    await session.prompt("Hello");
+    await waitFor(async () => (await readTurnSnapshots(session, ctx.cwd)).turns.length === 1, "hello snapshot missing");
+    const hello = (await readTurnSnapshots(session, ctx.cwd)).turns[0];
+    let ui = configureTestUI(session, []);
+    assert.equal((await session.navigateTree(hello.userEntryId, { summarize: false })).cancelled, false);
+    assert.equal(ui.selections.length, 0);
+    await session.reload();
+    configureTestUI(session, [], true);
+    for (const content of ["A", "B"]) {
+      const previousCount = (await readTurnSnapshots(session, ctx.cwd)).turns.length;
+      ctx.provider.setResponses([
+        fauxAssistantMessage([fauxToolCall("write", { path: "lifecycle.txt", content })]),
+        fauxAssistantMessage(content),
+      ]);
+      await session.prompt(`write ${content}`);
+      await waitFor(async () => (await readTurnSnapshots(session, ctx.cwd)).turns.length === previousCount + 1, "operation snapshot missing");
+    }
+    const records = (await readTurnSnapshots(session, ctx.cwd)).turns;
+    const beforeB = records[records.length - 1].userEntryId;
+    const file = path.join(ctx.cwd, "lifecycle.txt");
+    await session.prompt("/undo");
+    assert.equal(await readText(file), "A");
+    await session.reload();
+    configureTestUI(session, [], true);
+    await session.prompt("/redo");
+    assert.equal(await readText(file), "B");
+    await session.prompt("/undo");
+    assert.equal(await readText(file), "A");
+    ui = configureTestUI(session, []);
+    assert.notEqual(beforeB, session.sessionManager.getLeafId(), "exercise an actual tree navigation, not Pi's same-node no-op");
+    assert.equal((await session.navigateTree(beforeB, { summarize: false })).cancelled, false);
+    assert.equal(ui.selections.length, 0, "A to A should skip the choice");
+    await session.prompt("/redo");
+    assert.equal(await readText(file), "A", "automatic tree navigation must clear redo");
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "lifecycle.txt", content: "C" })]),
+      fauxAssistantMessage("C"),
+    ]);
+    await session.prompt("write C");
+    configureTestUI(session, [], true);
+    await session.prompt("/undo");
+    assert.equal(await readText(file), "A");
+    await session.prompt("/redo");
+    assert.equal(await readText(file), "C");
+  } finally {
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
 async function testTreeConversationOnlyAnchorsKeptWorkspace(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -908,7 +1086,7 @@ async function testTreeConversationOnlyAnchorsKeptWorkspace(): Promise<void> {
     const returnToBResult = await session.navigateTree(bAssistant.id, { summarize: false });
     assert.equal(returnToBResult.cancelled, false, "kept workspace should be anchored to the new conversation branch");
     assert.equal(normalizeEol(await readText(filePath)), "B\n");
-    assert.deepEqual(ui.selections.map(({ title }) => title), ["Tree navigation", "Tree navigation"]);
+    assert.equal(ui.selections.length, 1, "returning to the kept files should not prompt again");
 
     session.dispose();
   } finally {
@@ -998,7 +1176,7 @@ async function testCancelledConversationOnlySummaryDoesNotLeakAnchor(): Promise<
     assert.equal(combinedResult.cancelled, false, "navigation after an aborted summary should not reuse its pending anchor");
     assert.equal(normalizeEol(await readText(filePath)), "A\n");
     assert.equal(await countSnapshots(session, ctx.cwd, "manual"), 0, "an aborted summary must not anchor its snapshot later");
-    assert.deepEqual(ui.selections.map(({ title }) => title), ["Tree navigation", "Tree navigation"]);
+    assert.deepEqual(ui.selections.map(({ title }) => title), ["Tree navigation", "Tree navigation — target files differ"]);
 
     const aSnapshot = (await readTurnSnapshots(session, ctx.cwd)).turns[0];
     assert.ok(aSnapshot, "cancelled summary A turn snapshot should exist");
@@ -3981,6 +4159,9 @@ async function testSessionStartRebuildsSnapshotRetentionRefs(): Promise<void> {
 
 async function main(): Promise<void> {
   const tests: Array<{ name: string; run: () => Promise<void> }> = [
+    { name: "tree unchanged files skip choice", run: testTreeUnchangedFilesSkipChoice },
+    { name: "tree choice safety boundaries", run: testTreeChoiceSafetyBoundaries },
+    { name: "tree automatic navigation lifecycle", run: testTreeAutomaticNavigationLifecycle },
     { name: "missing previous snapshot falls back to a fresh before snapshot", run: testMissingPreviousSnapshotFallsBackToFreshBefore },
     { name: "branch snapshots survive Git prune", run: testBranchSnapshotsSurviveGitPrune },
     { name: "session start rebuilds snapshot retention refs", run: testSessionStartRebuildsSnapshotRetentionRefs },
