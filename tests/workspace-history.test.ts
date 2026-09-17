@@ -3481,7 +3481,7 @@ async function testFailedShadowRepoRebuildDoesNotLeaveCanonicalRepo(): Promise<v
   }
 }
 
-async function testStaleShadowRepoLockIsRecovered(): Promise<void> {
+async function testOldShadowRepoLockIsPreserved(): Promise<void> {
   const ctx = await createContext();
   try {
     const session = await createSession(ctx);
@@ -3508,12 +3508,216 @@ async function testStaleShadowRepoLockIsRecovered(): Promise<void> {
     const staleTime = new Date(Date.now() - 60_000);
     await utimes(lockPath, staleTime, staleTime);
 
+    await assert.rejects(session.prompt("create lock recovery file"), /index.lock is still present/);
+    assert.equal(await readText(lockPath), "stale lock\n", "age alone must never authorize deleting a lock");
+    // Simulate the owner finishing; navigation may then retry without data loss.
+    await rm(lockPath);
     await session.prompt("create lock recovery file");
     await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "after snapshot should be created after stale lock recovery");
-    assert.equal(await exists(lockPath), false, "stale index.lock should be removed automatically");
+    assert.equal(await exists(lockPath), false, "retry should finish once the owner releases its lock");
 
     session.dispose();
   } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testGitTimeoutTracksProcessAcrossReload(): Promise<void> {
+  let finished = false;
+  let slowCommand = true;
+  let running: Promise<unknown> | undefined;
+  const ctx = await createContext((pi) => {
+    const exec = pi.exec.bind(pi);
+    pi.exec = async (command, args, options) => {
+      if (command === "git" && args.includes("add") && slowCommand) {
+        slowCommand = false;
+        const gitDir = args[args.indexOf("--git-dir") + 1];
+        // A real child process models a slow Git writer holding the index lock.
+        running = exec(process.execPath, ["-e", "const fs=require('fs'); fs.writeFileSync(process.argv[1], 'busy'); setTimeout(()=>{fs.unlinkSync(process.argv[1]);},3000)", path.join(gitDir, "index.lock")], options)
+          .then(result => { finished = true; return result; });
+        return await running as Awaited<ReturnType<typeof pi.exec>>;
+      }
+      return exec(command, args, options);
+    };
+    workspaceHistoryExtension(pi);
+  });
+  await writeWorkspaceHistorySettings(ctx, { storageDir: getWorkspaceHistoryStateDir(ctx.rootDir), gitTimeoutMs: 1000 });
+  const session = await createSession(ctx);
+  try {
+    ctx.provider.setResponses([fauxAssistantMessage("Hello")]);
+    await assert.rejects(session.prompt("Hello"), /timed out/);
+    assert.equal(finished, false, "timed-out writer remains tracked until completion");
+    await assert.rejects(session.prompt("retry while busy"), /still running/);
+    await session.reload();
+    await assert.rejects(session.prompt("retry after reload while busy"), /still running/);
+    await running;
+    await session.prompt("retry after exit");
+  } finally {
+    await running;
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
+async function testNestedRepositorySnapshotBoundary(): Promise<void> {
+  for (const kind of ["empty", "committed", "gitfile", "previously-tracked"] as const) {
+    const ctx = await createContext();
+    const session = await createSession(ctx);
+    try {
+      const nested = path.join(ctx.cwd, "cmd", "模板 old");
+      if (kind === "committed") await initializeGitRepository(nested);
+      else if (kind === "gitfile") {
+        await mkdir(nested, { recursive: true });
+        await execFileAsync("git", ["init", "--separate-git-dir", path.join(ctx.rootDir, "child-git"), nested]);
+      } else if (kind === "empty") await initializeEmptyGitRepository(nested);
+      else await mkdir(nested, { recursive: true });
+      const nestedFile = path.join(nested, "keep.txt");
+      await writeFile(nestedFile, "nested original\n");
+      const ui = configureTestUI(session, [], true);
+      ctx.provider.setResponses([
+        fauxAssistantMessage([fauxToolCall("write", { path: "normal.txt", content: "A\n" })]),
+        fauxAssistantMessage("A"),
+        fauxAssistantMessage([fauxToolCall("write", { path: "normal.txt", content: "B\n" })]),
+        fauxAssistantMessage("B"),
+      ]);
+      await session.prompt("write A");
+      const first = (await readTurnSnapshots(session, ctx.cwd)).turns[0];
+      if (kind === "previously-tracked") await initializeEmptyGitRepository(nested);
+      await session.prompt("write B");
+      await writeFile(nestedFile, "nested manual\n");
+      await session.prompt("/undo");
+      assert.equal(await readText(path.join(ctx.cwd, "normal.txt")), "A\n");
+      assert.equal(await readText(nestedFile), "nested manual\n");
+      await session.prompt("/redo");
+      assert.equal(await readText(path.join(ctx.cwd, "normal.txt")), "B\n");
+      assert.equal(await readText(nestedFile), "nested manual\n");
+      const tracked = await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "ls-files", "--stage"));
+      assert.doesNotMatch(tracked.stdout, /160000|keep.txt/);
+      assert.equal(ui.notifications.filter(message => message.includes("模板 old") && message.includes("not included")).length, 1);
+      if (kind === "previously-tracked") {
+        await session.navigateTree(first.assistantEntryId, { summarize: false });
+        assert.equal(await readText(nestedFile), "nested manual\n", "old snapshots must not overwrite a newly nested repository");
+        assert.equal(await readText(path.join(ctx.cwd, "normal.txt")), "A\n");
+      }
+    } finally {
+      session.dispose();
+      await disposeContext(ctx);
+    }
+  }
+}
+
+async function testRealGitAddTimeout(): Promise<void> {
+  let filterCommand = "";
+  let addFinished = false;
+  let addOperation: Promise<unknown> | undefined;
+  let slow = true;
+  const ctx = await createContext((pi) => {
+    const exec = pi.exec.bind(pi);
+    pi.exec = async (command, args, options) => {
+      if (command === "git" && args.includes("add") && slow) {
+        slow = false;
+        try {
+          const operation = exec(command, ["-c", `filter.whslow.clean=${filterCommand}`, ...args], options);
+          addOperation = operation;
+          return await operation;
+        } finally {
+          addFinished = true;
+        }
+      }
+      return exec(command, args, options);
+    };
+    workspaceHistoryExtension(pi);
+  });
+  const filter = path.join(ctx.rootDir, "slow-filter.cjs");
+  await writeFile(filter, "const fs=require('fs');const data=fs.readFileSync(0);Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,3000);process.stdout.write(data);\n");
+  filterCommand = `"${process.execPath.replace(/\\/g, "/")}" "${filter.replace(/\\/g, "/")}"`;
+  await writeFile(path.join(ctx.cwd, ".gitattributes"), "slow.txt filter=whslow\n");
+  await writeFile(path.join(ctx.cwd, "slow.txt"), "slow data\n");
+  await writeWorkspaceHistorySettings(ctx, { storageDir: getWorkspaceHistoryStateDir(ctx.rootDir), gitTimeoutMs: 1000 });
+  const session = await createSession(ctx);
+  try {
+    ctx.provider.setResponses([fauxAssistantMessage("Hello")]);
+    await assert.rejects(session.prompt("Hello"), /timed out/);
+    assert.equal(addFinished, false, "the real git add must remain tracked after timeout");
+    await assert.rejects(session.prompt("retry while Git runs"), /still running/);
+    await addOperation;
+    const lockPath = path.join(getShadowGitDir(session, ctx.cwd), "index.lock");
+    assert.equal(await pathExists(lockPath), false, "completed git add should release its own lock");
+    await session.prompt("Hello retry");
+    assert.equal(await readText(path.join(ctx.cwd, "slow.txt")), "slow data\n");
+    assert.equal(await getShadowStatus(session, ctx.cwd), "");
+  } finally {
+    await addOperation;
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
+async function testRestoreTimeoutWaitsBeforeRollback(): Promise<void> {
+  for (const slowCommand of ["reset", "checkout-index", "clean"]) {
+    let delayRestore = false;
+    let finished = false;
+    const ctx = await createContext((pi) => {
+      const exec = pi.exec.bind(pi);
+      pi.exec = async (command, args, options) => {
+        if (command === "git" && args.includes(slowCommand) && delayRestore) {
+          delayRestore = false;
+          await exec(process.execPath, ["-e", "setTimeout(()=>{},2000)"], options);
+          const result = await exec(command, args, options);
+          finished = true;
+          return result;
+        }
+        return exec(command, args, options);
+      };
+      workspaceHistoryExtension(pi);
+    });
+    await writeWorkspaceHistorySettings(ctx, { storageDir: getWorkspaceHistoryStateDir(ctx.rootDir), gitTimeoutMs: 1000 });
+    const session = await createSession(ctx);
+    try {
+      configureTestUI(session, [], true);
+      for (const value of ["A", "B"]) {
+        ctx.provider.setResponses([
+          fauxAssistantMessage([fauxToolCall("write", { path: "file.txt", content: value })]),
+          fauxAssistantMessage(value),
+        ]);
+        await session.prompt(value);
+      }
+      const leaf = session.sessionManager.getLeafId();
+      delayRestore = true;
+      await session.prompt("/undo");
+      assert.ok(finished, "failed restore must finish before rollback and navigation return");
+      assert.equal(session.sessionManager.getLeafId(), leaf);
+      assert.equal(await readText(path.join(ctx.cwd, "file.txt")), "B", "rollback must finish restoring original files");
+      await session.prompt("/undo");
+      assert.equal(await readText(path.join(ctx.cwd, "file.txt")), "A");
+    } finally {
+      session.dispose();
+      await disposeContext(ctx);
+    }
+  }
+}
+
+async function testSnapshotDiscoveryHonorsGitIgnoresWithoutScanLimit(): Promise<void> {
+  const ctx = await createContext();
+  await writeWorkspaceHistorySettings(ctx, {
+    storageDir: getWorkspaceHistoryStateDir(ctx.rootDir), maxScanFiles: 10, maxScanDirs: 5,
+  });
+  await mkdir(path.join(ctx.cwd, "sub", "generated"), { recursive: true });
+  await writeFile(path.join(ctx.cwd, "sub", ".gitignore"), "generated/\n");
+  await Promise.all(Array.from({ length: 50 }, async (_, index) => {
+    await writeFile(path.join(ctx.cwd, `normal-${index}.txt`), "normal\n");
+    await mkdir(path.join(ctx.cwd, "sub", "generated", `dir-${index}`));
+    await writeFile(path.join(ctx.cwd, "sub", "generated", `dir-${index}`, "ignored.txt"), "ignored\n");
+  }));
+  const session = await createSession(ctx);
+  try {
+    ctx.provider.setResponses([fauxAssistantMessage("Hello")]);
+    await session.prompt("Hello");
+    const tracked = await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "ls-files"));
+    assert.match(tracked.stdout, /normal-49.txt/);
+    assert.doesNotMatch(tracked.stdout, /generated/);
+  } finally {
+    session.dispose();
     await disposeContext(ctx);
   }
 }
@@ -4159,6 +4363,11 @@ async function testSessionStartRebuildsSnapshotRetentionRefs(): Promise<void> {
 
 async function main(): Promise<void> {
   const tests: Array<{ name: string; run: () => Promise<void> }> = [
+    { name: "restore timeout waits before rollback", run: testRestoreTimeoutWaitsBeforeRollback },
+    { name: "snapshot discovery honors nested ignores without scan limits", run: testSnapshotDiscoveryHonorsGitIgnoresWithoutScanLimit },
+    { name: "real git add timeout", run: testRealGitAddTimeout },
+    { name: "nested repository snapshot boundary", run: testNestedRepositorySnapshotBoundary },
+    { name: "git timeout tracks process across reload", run: testGitTimeoutTracksProcessAcrossReload },
     { name: "tree unchanged files skip choice", run: testTreeUnchangedFilesSkipChoice },
     { name: "tree choice safety boundaries", run: testTreeChoiceSafetyBoundaries },
     { name: "tree automatic navigation lifecycle", run: testTreeAutomaticNavigationLifecycle },
@@ -4224,7 +4433,7 @@ async function main(): Promise<void> {
     { name: "missing cached shadow repo is rebuilt", run: testMissingCachedShadowRepoIsRebuilt },
     { name: "invalid reusable shadow repo is quarantined and rebuilt", run: testInvalidReusableShadowRepoIsQuarantinedAndRebuilt },
     { name: "failed shadow repo rebuild does not leave canonical repo", run: testFailedShadowRepoRebuildDoesNotLeaveCanonicalRepo },
-    { name: "stale shadow repo lock is recovered", run: testStaleShadowRepoLockIsRecovered },
+    { name: "old shadow repo lock is preserved until released", run: testOldShadowRepoLockIsPreserved },
     { name: "unicode paths survive undo and redo", run: testUnicodePathsSurviveUndoRedo },
     { name: "undo and redo block on unsnapshotted manual changes", run: testUndoAndRedoBlockOnUnsnapshottedManualChanges },
     { name: ".gitignore stops managing ignored paths", run: testGitignoreStopsManagingIgnoredPaths },

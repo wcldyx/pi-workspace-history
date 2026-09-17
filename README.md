@@ -112,6 +112,12 @@ The same file-history workflow works in Git repositories, Jujutsu repositories, 
 
 The extension still requires the Git executable for its private shadow repository, including when the workspace itself uses only Jujutsu.
 
+Nested Git repositories (including empty repositories and worktrees with a `.git` file) are excluded from the outer workspace's snapshots and undo/redo. A warning identifies each excluded repository once per extension session. Open the child repository directly to manage its history. Git lists candidate paths using its ignore rules, including nested `.gitignore` files; repository detection does not impose the restore scan limits on ordinary snapshots.
+
+If a Git command exceeds `workspaceHistory.gitTimeoutMs`, it remains tracked until it finishes; further Git operations for that workspace are blocked in the same Pi process, including across extension reloads. This avoids starting another writer while the first still owns `index.lock`. Increase the timeout for large workspaces and retry after Git finishes. Lock age alone never authorizes deletion: an unknown leftover lock is preserved with its path in the error. Only remove it after verifying that no Git process is using that shadow repository.
+
+For restore commands that change workspace files, a timeout waits for the command to finish before rollback starts. This can take longer than the configured timeout, but prevents the background restore and rollback from writing the same files concurrently.
+
 A single undo unit lasts from the original prompt until Pi reports that the agent is settled. Intermediate tool rounds receive their own tree anchors, but queued input never replaces the operation's original prompt or `before` snapshot. One `/undo` therefore removes the complete result of a multi-round operation, and `/redo` restores it as a unit.
 
 For conversation-only navigation without a branch summary, the plugin first resolves any pending recovery from an earlier interrupted restore. If files changed after that interrupted restore, those later edits are kept automatically. The plugin then snapshots the current files before moving the conversation and uses the snapshot as the seed of the continued history branch. Once the conversation continues, its normal visible message nodes restore that kept workspace state through `/tree`. Cancelling the choice leaves both conversation and workspace unchanged. In non-interactive modes, navigation keeps the previous combined conversation-and-workspace behavior.

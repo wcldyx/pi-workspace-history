@@ -36,7 +36,6 @@ const DEFAULT_MAX_SCAN_DIRS = 3_000;
 const DEFAULT_MAX_SCAN_MS = 5_000;
 const DEFAULT_GIT_TIMEOUT_MS = 60_000;
 const SHADOW_REPO_LOCK_WAIT_MS = 5_000;
-const SHADOW_REPO_LOCK_STALE_MS = 15_000;
 const RESTORE_FILE_LOCK_RETRY_DELAYS_MS = [100, 250, 500] as const;
 const WORKSPACE_HISTORY_LOG_ENV = "PI_WORKSPACE_HISTORY_LOG";
 const MULTI_REPO_SCAN_MAX_DIRS = 256;
@@ -137,6 +136,7 @@ interface MultiRepoContainerCache {
 }
 
 interface RuntimeState {
+  warnedNestedRepositories?: Set<string>;
   pendingTurnId?: string;
   pendingBeforeCommit?: string;
   pendingPromptText?: string;
@@ -312,33 +312,10 @@ async function waitForShadowRepoIndexLock(ctx: ExtensionContext, state?: Runtime
       return true;
     }
 
-    const lockStat = await stat(lockPath).catch(() => undefined);
-    if (lockStat && Date.now() - lockStat.mtimeMs > SHADOW_REPO_LOCK_STALE_MS) {
-      await unlink(lockPath).catch(() => undefined);
-      return !await exists(lockPath);
-    }
-
     await sleep(100);
   }
 
   return !await exists(lockPath);
-}
-
-async function clearStaleShadowRepoIndexLock(ctx: ExtensionContext, state?: RuntimeState): Promise<boolean> {
-  const paths = await getWorkspaceStoragePaths(ctx, state);
-  const lockPath = path.join(paths.shadowGitDir, "index.lock");
-
-  if (!await exists(lockPath)) {
-    return false;
-  }
-
-  const lockStat = await stat(lockPath).catch(() => undefined);
-  if (lockStat && Date.now() - lockStat.mtimeMs <= SHADOW_REPO_LOCK_STALE_MS) {
-    return false;
-  }
-
-  await unlink(lockPath).catch(() => undefined);
-  return true;
 }
 
 function getAgentDir(): string {
@@ -777,6 +754,60 @@ async function getGitTimeoutMs(ctx: ExtensionContext, state?: RuntimeState): Pro
   return settings.gitTimeoutMs;
 }
 
+const PENDING_GIT_KEY = Symbol.for("pi-workspace-history.pending-git");
+const sharedGitState = globalThis as typeof globalThis & { [PENDING_GIT_KEY]?: Map<string, Set<Promise<unknown>>> };
+const pendingGitCommands = sharedGitState[PENDING_GIT_KEY] ??= new Map();
+
+async function getGitWorkspaceKey(ctx: ExtensionContext): Promise<string> {
+  const cwd = path.normalize(await realpath(ctx.cwd));
+  return process.platform === "win32" ? cwd.toLowerCase() : cwd;
+}
+
+async function assertNoPendingGit(ctx: ExtensionContext): Promise<string> {
+  const workspaceKey = await getGitWorkspaceKey(ctx);
+  if (pendingGitCommands.has(workspaceKey)) {
+    throw new Error("A previously timed-out Git command is still running for this workspace. New Git operations are blocked until it finishes; do not remove index.lock.");
+  }
+  return workspaceKey;
+}
+
+async function runGitCommand(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  args: string[],
+  state?: RuntimeState,
+): Promise<Awaited<ReturnType<ExtensionAPI["exec"]>>> {
+  const timeout = await getGitTimeoutMs(ctx, state);
+  // Keep ownership across extension reloads. Do not terminate only the wrapper
+  // process on Windows: Git's descendants can still hold and write the index.
+  const workspaceKey = await assertNoPendingGit(ctx);
+  const operation = pi.exec("git", args, { cwd: ctx.cwd });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const operations = pendingGitCommands.get(workspaceKey) ?? new Set<Promise<unknown>>();
+      operations.add(operation);
+      pendingGitCommands.set(workspaceKey, operations);
+      void operation.finally(() => {
+        operations.delete(operation);
+        if (operations.size === 0 && pendingGitCommands.get(workspaceKey) === operations) pendingGitCommands.delete(workspaceKey);
+      }).catch(() => undefined);
+      reject(new Error(`git ${summarizeGitArgs(args)} timed out after ${timeout}ms. Git is still being tracked; new operations are blocked until it exits. Do not remove index.lock. For large workspaces, increase workspaceHistory.gitTimeoutMs.`));
+    }, timeout);
+  });
+  try {
+    return await Promise.race([operation, expired]);
+  } catch (error) {
+    if (args.includes("checkout-index") || args.includes("clean")) {
+      // A restore must finish touching files before its rollback can begin.
+      await operation.catch(() => undefined);
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function getScanBudget(ctx: ExtensionContext, state?: RuntimeState): Promise<{ maxFiles: number; maxDirs: number; maxMs: number }> {
   const settings = await getWorkspaceHistorySettings(ctx, state);
   return {
@@ -824,11 +855,7 @@ async function listSubdirectories(dirPath: string): Promise<string[]> {
 }
 
 async function isBareShadowGitDir(pi: ExtensionAPI, ctx: ExtensionContext, gitDir: string, state?: RuntimeState): Promise<boolean> {
-  const result = await withTimeout(
-    pi.exec("git", ["--git-dir", gitDir, "rev-parse", "--is-bare-repository"], { cwd: ctx.cwd }),
-    await getGitTimeoutMs(ctx, state),
-    "git shadow repo validation",
-  );
+  const result = await runGitCommand(pi, ctx, ["--git-dir", gitDir, "rev-parse", "--is-bare-repository"], state);
   return result.code === 0 && result.stdout.trim() === "true";
 }
 
@@ -836,11 +863,7 @@ async function isReusableShadowGitDir(pi: ExtensionAPI, ctx: ExtensionContext, g
   if (!await isBareShadowGitDir(pi, ctx, gitDir, state)) {
     return false;
   }
-  const result = await withTimeout(
-    pi.exec("git", ["--git-dir", gitDir, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"], { cwd: ctx.cwd }),
-    await getGitTimeoutMs(ctx, state),
-    "git reusable shadow repo validation",
-  );
+  const result = await runGitCommand(pi, ctx, ["--git-dir", gitDir, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"], state);
   return result.code === 0;
 }
 
@@ -1218,16 +1241,72 @@ async function filterSnapshotPaths(
   relativePaths: string[],
   state?: RuntimeState,
 ): Promise<string[]> {
-  const includedPaths: string[] = [];
-  for (const relativePath of relativePaths) {
-    if (!await isSnapshotPathExcluded(ctx, relativePath, state)) {
-      includedPaths.push(relativePath);
-    }
-  }
-  return includedPaths;
+  const matcher = await getSnapshotIgnoreMatcher(ctx, state);
+  const hardMatcher = getHardExcludeMatcher(state);
+  const included = relativePaths.filter(relativePath => {
+    const normalized = normalizeSnapshotPath(relativePath);
+    return !isWindowsReservedSnapshotPath(normalized)
+      && !hardMatcher.ignores(normalized) && !matcher.ignores(normalized);
+  });
+  const repositories = await findNestedRepositoryBoundaries(ctx, included, state);
+  return included.filter(relativePath => {
+    const normalized = normalizeSnapshotPath(relativePath).replace(/\/$/, "");
+    return !repositories.some(repo => normalized === repo || normalized.startsWith(repo + "/"));
+  });
 }
 
-async function listExcludedWorkspacePaths(ctx: ExtensionContext, state?: RuntimeState): Promise<string[]> {
+async function findNestedRepositoryBoundaries(
+  ctx: ExtensionContext,
+  candidates: string[],
+  state?: RuntimeState,
+): Promise<string[]> {
+  const directories = new Set<string>();
+  for (const candidate of candidates) {
+    let relative = normalizeSnapshotPath(candidate).replace(/\/$/, "");
+    while (relative && relative !== ".") {
+      directories.add(relative);
+      const parent = path.posix.dirname(relative);
+      if (parent === relative) break;
+      relative = parent;
+    }
+  }
+  const repositories: string[] = [];
+  const paths = [...directories];
+  for (let offset = 0; offset < paths.length; offset += 32) {
+    await Promise.all(paths.slice(offset, offset + 32).map(async relative => {
+      try {
+        await access(path.join(ctx.cwd, relative, ".git"));
+        repositories.push(relative);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+      }
+    }));
+  }
+  const roots = repositories.filter(repo => !repositories.some(parent => repo !== parent && repo.startsWith(parent + "/"))).sort();
+  for (const repo of roots) {
+    if (!state?.warnedNestedRepositories?.has(repo)) {
+      ctx.ui.notify(`Nested Git repository "${repo}" is not included in workspace snapshots or undo/redo. Open that repository directly to manage its file history.`, "warning");
+      if (state) (state.warnedNestedRepositories ??= new Set()).add(repo);
+    }
+  }
+  return roots;
+}
+
+async function findNestedRepositories(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  state?: RuntimeState,
+): Promise<string[]> {
+  // Git handles nested .gitignore files and reports untracked repositories as
+  // directory entries. Inspect only these paths and tracked paths' ancestors.
+  const result = await runGitCommand(pi, ctx, await gitArgs(ctx, state, "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "."), state);
+  if (result.code !== 0) throw new Error(result.stderr || result.stdout || "git ls-files failed");
+  return findNestedRepositoryBoundaries(ctx, parseNullSeparatedPaths(result.stdout), state);
+}
+
+async function listExcludedWorkspacePaths(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<string[]> {
+  const nestedRepositories = new Set(await findNestedRepositories(pi, ctx, state));
   const budget = await getScanBudget(ctx, state);
   const startedAt = Date.now();
   let scannedFiles = 0;
@@ -1258,7 +1337,7 @@ async function listExcludedWorkspacePaths(ctx: ExtensionContext, state?: Runtime
         scannedFiles += 1;
       }
       checkBudget(relativePath);
-      if (await isSnapshotPathExcluded(ctx, relativePath, state)) {
+      if (nestedRepositories.has(normalizeSnapshotPath(relativePath)) || await isSnapshotPathExcluded(ctx, relativePath, state)) {
         excludedPaths.push(relativePath);
         continue;
       }
@@ -1371,15 +1450,17 @@ function getGitRestoreFileOperationFailureDetail(value: unknown): string | undef
 }
 
 async function execGit(pi: ExtensionAPI, ctx: ExtensionContext, args: string[]): Promise<string> {
+  await assertNoPendingGit(ctx);
   const state = undefined;
-  const timeoutMs = await getGitTimeoutMs(ctx, state);
   const paths = await getWorkspaceStoragePaths(ctx, state);
   const usesShadowGitDir = args.includes("--git-dir") && args.includes(paths.shadowGitDir);
   const startedAt = Date.now();
-  const runGit = () => withTimeout(pi.exec("git", args, { cwd: ctx.cwd }), timeoutMs, `git ${args[0] ?? "command"}`);
+  const runGit = () => runGitCommand(pi, ctx, args, state);
   if (usesShadowGitDir) {
     await logLine(ctx, `git start ${summarizeGitArgs(args)}`, state);
-    await waitForShadowRepoIndexLock(ctx, state);
+    if (!await waitForShadowRepoIndexLock(ctx, state)) {
+      throw new Error(`Shadow Git index.lock is still present at ${path.join(paths.shadowGitDir, "index.lock")}. It was not removed because its owner may still be running. Wait for Git to finish; only remove the lock after verifying that no process is using this repository.`);
+    }
   }
   const result = await runGit();
   const successfulRestoreFailure = result.code === 0
@@ -1387,7 +1468,7 @@ async function execGit(pi: ExtensionAPI, ctx: ExtensionContext, args: string[]):
     : undefined;
   if (result.code !== 0 || successfulRestoreFailure) {
     const output = result.stderr || result.stdout;
-    if (result.code !== 0 && usesShadowGitDir && output.includes("index.lock") && (await waitForShadowRepoIndexLock(ctx, state) || await clearStaleShadowRepoIndexLock(ctx, state))) {
+    if (result.code !== 0 && usesShadowGitDir && output.includes("index.lock") && await waitForShadowRepoIndexLock(ctx, state)) {
       const retry = await runGit();
       const retryRestoreFailure = retry.code === 0
         ? getGitRestoreFileOperationFailureDetail(retry.stderr)
@@ -1396,7 +1477,7 @@ async function execGit(pi: ExtensionAPI, ctx: ExtensionContext, args: string[]):
         await logLine(ctx, `git ok retry ${elapsedMs(startedAt)}ms ${summarizeGitArgs(args)}`, state).catch(() => undefined);
         return retry.stdout.trim();
       }
-      throw new Error(`git ${args.join(" ")} failed after clearing stale index.lock: ${retry.stderr || retry.stdout}`);
+      throw new Error(`git ${args.join(" ")} failed after waiting for index.lock: ${retry.stderr || retry.stdout}`);
     }
     const failureReason = successfulRestoreFailure ? "reported an incomplete workspace update" : "failed";
     throw new Error(`git ${args.join(" ")} ${failureReason}: ${output}`);
@@ -1501,7 +1582,20 @@ async function pruneShadowIndexForIgnoreChanges(pi: ExtensionAPI, ctx: Extension
 async function stageSnapshotFiles(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
   const startedAt = Date.now();
   await logLine(ctx, "stage snapshot start", state);
-  await execGit(pi, ctx, await gitArgs(ctx, state, "add", "-A", "--", "."));
+  const nestedRepositories = await findNestedRepositories(pi, ctx, state);
+  await pruneShadowIndexForIgnoreChanges(pi, ctx, state);
+  if (nestedRepositories.length === 0) {
+    await execGit(pi, ctx, await gitArgs(ctx, state, "add", "-A", "--", "."));
+  } else {
+    const paths = await getWorkspaceStoragePaths(ctx, state);
+    const pathspecFile = path.join(paths.sessionRoot, `nested-${randomUUID()}.txt`);
+    try {
+      await writeFile(pathspecFile, [".", ...nestedRepositories.map(repo => `:(top,literal,exclude)${repo}`)].join("\0") + "\0");
+      await execGit(pi, ctx, await gitArgs(ctx, state, "add", "-A", "--pathspec-from-file", pathspecFile, "--pathspec-file-nul"));
+    } finally {
+      await unlink(pathspecFile).catch(() => undefined);
+    }
+  }
   await logLine(ctx, `stage snapshot git-add done ${elapsedMs(startedAt)}ms`, state);
   await pruneShadowIndexForIgnoreChanges(pi, ctx, state);
   await logLine(ctx, `stage snapshot done ${elapsedMs(startedAt)}ms`, state);
@@ -1512,11 +1606,7 @@ async function hasWorkspaceChanges(pi: ExtensionAPI, ctx: ExtensionContext, stat
   await assertWorkspaceHistoryEnabled(ctx, state, "hasWorkspaceChanges");
   await ensureShadowRepo(pi, ctx, state);
 
-  const statusResult = await withTimeout(
-    pi.exec("git", await gitArgs(ctx, state, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "."), { cwd: ctx.cwd }),
-    await getGitTimeoutMs(ctx, state),
-    "git status",
-  );
+  const statusResult = await runGitCommand(pi, ctx, await gitArgs(ctx, state, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "."), state);
   if (statusResult.code !== 0) {
     throw new Error(statusResult.stderr || statusResult.stdout || "git status failed");
   }
@@ -1530,11 +1620,7 @@ async function hasWorkspaceChanges(pi: ExtensionAPI, ctx: ExtensionContext, stat
 async function getHeadCommit(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<string | undefined> {
   await assertWorkspaceHistoryEnabled(ctx, state, "getHeadCommit");
   await ensureShadowRepo(pi, ctx, state);
-  const result = await withTimeout(
-    pi.exec("git", await gitArgs(ctx, state, "rev-parse", "--verify", "HEAD"), { cwd: ctx.cwd }),
-    await getGitTimeoutMs(ctx, state),
-    "git rev-parse",
-  );
+  const result = await runGitCommand(pi, ctx, await gitArgs(ctx, state, "rev-parse", "--verify", "HEAD"), state);
   return result.code === 0 ? result.stdout.trim() : undefined;
 }
 
@@ -1574,6 +1660,7 @@ async function buildShadowGitDir(
 }
 
 async function ensureShadowRepo(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
+  await assertNoPendingGit(ctx);
   const startedAt = Date.now();
   await assertWorkspaceHistoryEnabled(ctx, state, "ensureShadowRepo");
   const paths = await ensureStorageDirs(ctx, state);
@@ -1641,15 +1728,7 @@ async function isSnapshotCommitAvailable(
   state?: RuntimeState,
 ): Promise<boolean> {
   await ensureShadowRepo(pi, ctx, state);
-  const result = await withTimeout(
-    pi.exec(
-      "git",
-      await gitArgs(ctx, state, "rev-parse", "--verify", "--quiet", `${commit}^{commit}`),
-      { cwd: ctx.cwd },
-    ),
-    await getGitTimeoutMs(ctx, state),
-    "git rev-parse snapshot commit",
-  );
+  const result = await runGitCommand(pi, ctx, await gitArgs(ctx, state, "rev-parse", "--verify", "--quiet", `${commit}^{commit}`), state);
   if (result.code === 0) {
     return true;
   }
@@ -1736,7 +1815,7 @@ async function createSnapshotCommit(
 async function restoreSnapshotCommit(pi: ExtensionAPI, ctx: ExtensionContext, commit: string, state?: RuntimeState): Promise<string> {
   await assertWorkspaceHistoryEnabled(ctx, state, "restoreSnapshotCommit");
   await ensureShadowRepo(pi, ctx, state);
-  const protectedPaths = await listExcludedWorkspacePaths(ctx, state);
+  const protectedPaths = await listExcludedWorkspacePaths(pi, ctx, state);
 
   await execGit(pi, ctx, await gitArgs(ctx, state, "reset", "--mixed", "--no-refresh", commit));
   await pruneShadowIndexForIgnoreChanges(pi, ctx, state);
@@ -1888,6 +1967,12 @@ async function restoreSnapshotCommitSafely(
     scheduleCleanup(ctx, state);
     return restoredCommit;
   } catch (error) {
+    // Reset/prune can also time out before checkout. Settle all outstanding Git
+    // work before attempting rollback or recording a recovery snapshot.
+    const workspaceKey = await getGitWorkspaceKey(ctx);
+    while (pendingGitCommands.has(workspaceKey)) {
+      await Promise.allSettled([...(pendingGitCommands.get(workspaceKey) ?? [])]);
+    }
     try {
       await restoreSnapshotCommitWithRetry(pi, ctx, rollbackCommit, state);
     } catch (rollbackError) {
@@ -2197,15 +2282,7 @@ async function reconcileSnapshotRetentionRefs(
   }
 
   await ensureShadowRepo(pi, ctx, state);
-  const refsResult = await withTimeout(
-    pi.exec(
-      "git",
-      await gitArgs(ctx, state, "for-each-ref", "--format=%(refname)", SNAPSHOT_RETENTION_REF_PREFIX),
-      { cwd: ctx.cwd },
-    ),
-    await getGitTimeoutMs(ctx, state),
-    "git for-each-ref snapshot retention",
-  );
+  const refsResult = await runGitCommand(pi, ctx, await gitArgs(ctx, state, "for-each-ref", "--format=%(refname)", SNAPSHOT_RETENTION_REF_PREFIX), state);
   if (refsResult.code !== 0) {
     throw new Error(refsResult.stderr || refsResult.stdout || "git for-each-ref snapshot retention failed");
   }
@@ -2587,19 +2664,7 @@ async function isWorkspaceDirtyAgainstCommit(
     return changed ? "dirty" : "clean";
   }
 
-  const diffResult = await withTimeout(
-    pi.exec(
-      "git",
-      await gitArgs(ctx, state, "diff", "--quiet", commit, "--", "."),
-      { cwd: ctx.cwd },
-    ),
-    await getGitTimeoutMs(ctx, state),
-    "git diff",
-  );
-
-  if (diffResult.code === 1) {
-    return "dirty";
-  }
+  const diffResult = await runGitCommand(pi, ctx, await gitArgs(ctx, state, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", commit, "--", "."), state);
 
   if (diffResult.code !== 0) {
     if (!await isSnapshotCommitAvailable(pi, ctx, commit, state)) {
@@ -2609,21 +2674,16 @@ async function isWorkspaceDirtyAgainstCommit(
     throw new Error(diffResult.stderr || diffResult.stdout || "git diff failed");
   }
 
-  const untrackedResult = await withTimeout(
-    pi.exec(
-      "git",
-      await gitArgs(ctx, state, "ls-files", "--others", "--exclude-standard", "-z", "--", "."),
-      { cwd: ctx.cwd },
-    ),
-    await getGitTimeoutMs(ctx, state),
-    "git ls-files --others",
-  );
+  const untrackedResult = await runGitCommand(pi, ctx, await gitArgs(ctx, state, "ls-files", "--others", "--exclude-standard", "-z", "--", "."), state);
 
   if (untrackedResult.code !== 0) {
     throw new Error(untrackedResult.stderr || untrackedResult.stdout || "git ls-files failed");
   }
 
-  const changed = untrackedResult.stdout.trim().length > 0;
+  const changed = (await filterSnapshotPaths(ctx, [
+    ...parseNullSeparatedPaths(diffResult.stdout),
+    ...parseNullSeparatedPaths(untrackedResult.stdout),
+  ], state)).length > 0;
   await logLine(ctx, `dirty against commit via diff ${elapsedMs(startedAt)}ms commit=${commit} changed=${String(changed)}`, state);
   return changed ? "dirty" : "clean";
 }
