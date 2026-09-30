@@ -108,6 +108,8 @@
 
 插件内部使用独立的 shadow git 来保存快照，而不是依赖用户项目本身的 `.git` 历史。
 
+内部快照提交不使用 Git 签名，因此保存历史无需解锁签名密钥。用户的全局和项目 Git 签名设置保持不变。
+
 同一套文件历史流程可用于 Git 仓库、Jujutsu 仓库以及 Git/Jujutsu colocated 仓库。仓库元数据（`.git/` 和 `.jj/`）不会进入快照，也不会被恢复。因此，工作区撤销只恢复文件内容，不会回退 Git 的 commit、branch 或 index，也不会回退 Jujutsu 的 commit、bookmark 或 operation。撤销后，`git status` 或 `jj status` 可能会把恢复的文件显示为工作区修改；如需回退仓库历史，请使用对应 VCS 自身的恢复命令。
 
 嵌套 Git 仓库（包括没有提交的空仓库和使用 `.git` 文件的 worktree）不会纳入外层工作区的快照和 undo/redo。插件会在每个扩展运行周期内对每个排除仓库提示一次路径；需要管理其历史时，请直接进入子仓库运行 Pi。候选路径由 Git 按忽略规则列出，包括子目录 `.gitignore`；仓库检测不会把恢复扫描的数量上限施加到普通快照上。

@@ -1519,6 +1519,10 @@ async function gitCommitArgs(ctx: ExtensionContext, state: RuntimeState | undefi
     "user.name=workspace-history",
     "-c",
     "user.email=workspace-history@local",
+    "-c",
+    "commit.gpgsign=false",
+    "-c",
+    "tag.gpgsign=false",
     ...(await gitArgs(ctx, state, ...args)),
   ];
 }

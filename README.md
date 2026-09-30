@@ -108,6 +108,8 @@ This plugin is built around the following concrete requirements:
 
 The plugin stores snapshots in an internal shadow git repository instead of relying on the user's project `.git` history.
 
+Internal snapshot commits do not use Git signing, so saving history never requires unlocking a signing key. Your global and project Git signing settings remain unchanged.
+
 The same file-history workflow works in Git repositories, Jujutsu repositories, and colocated Git/Jujutsu repositories. Repository metadata (`.git/` and `.jj/`) is never snapshotted or restored. Consequently, workspace undo restores file contents but does not rewind Git commits, branches, or the index, nor Jujutsu commits, bookmarks, or operations. After an undo, `git status` or `jj status` may show the restored files as working-copy changes; use the VCS's own recovery commands when repository history must also change.
 
 The extension still requires the Git executable for its private shadow repository, including when the workspace itself uses only Jujutsu.

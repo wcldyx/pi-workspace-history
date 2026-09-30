@@ -1342,6 +1342,28 @@ async function testConversationOnlyNavigationPreservesEditsAfterPendingRecovery(
   }
 }
 
+async function testSnapshotIgnoresGlobalSigning(): Promise<void> {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "pi-history-signing-"));
+  const previousGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+  try {
+    const configPath = path.join(rootDir, "gitconfig");
+    process.env.GIT_CONFIG_GLOBAL = configPath;
+    for (const format of ["openpgp", "ssh"]) {
+      const config = `[commit]\n\tgpgsign = true\n[tag]\n\tgpgsign = true\n[gpg]\n\tformat = ${format}\n\tprogram = pi-history-missing-signer\n[gpg "ssh"]\n\tprogram = pi-history-missing-signer\n[user]\n\tsigningkey = missing-test-key\n`;
+      await writeFile(configPath, config, "utf8");
+      await testUndoRedo();
+      assert.equal(await readFile(configPath, "utf8"), config, "snapshot operations must preserve global signing settings");
+    }
+  } finally {
+    if (previousGlobalConfig === undefined) {
+      delete process.env.GIT_CONFIG_GLOBAL;
+    } else {
+      process.env.GIT_CONFIG_GLOBAL = previousGlobalConfig;
+    }
+    await rm(rootDir, { recursive: true, force: true });
+  }
+}
+
 async function testUndoRedo(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -4363,6 +4385,7 @@ async function testSessionStartRebuildsSnapshotRetentionRefs(): Promise<void> {
 
 async function main(): Promise<void> {
   const tests: Array<{ name: string; run: () => Promise<void> }> = [
+    { name: "snapshot ignores global signing", run: testSnapshotIgnoresGlobalSigning },
     { name: "restore timeout waits before rollback", run: testRestoreTimeoutWaitsBeforeRollback },
     { name: "snapshot discovery honors nested ignores without scan limits", run: testSnapshotDiscoveryHonorsGitIgnoresWithoutScanLimit },
     { name: "real git add timeout", run: testRealGitAddTimeout },
