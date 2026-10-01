@@ -1,4 +1,4 @@
-import { access, copyFile, mkdtemp, mkdir, readFile, readdir, realpath, rm, utimes, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
@@ -3628,6 +3628,56 @@ async function testNestedRepositorySnapshotBoundary(): Promise<void> {
   }
 }
 
+async function findWindowsAppExecutionAlias(): Promise<string | undefined> {
+  const aliasDir = path.join(process.env.LOCALAPPDATA ?? "", "Microsoft", "WindowsApps");
+  const entries = await readdir(aliasDir).catch(() => [] as string[]);
+  for (const entry of entries.filter(name => name.toLowerCase().endsWith(".exe"))) {
+    try {
+      await access(path.join(aliasDir, entry, ".git"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EACCES") return path.join(aliasDir, entry);
+    }
+  }
+  return undefined;
+}
+
+async function testInaccessibleNestedRepositoryProbeIsSkipped(): Promise<void> {
+  if (process.platform !== "win32") {
+    return;
+  }
+  const alias = await findWindowsAppExecutionAlias();
+  if (!alias) {
+    console.log("  skipped: no Windows app execution alias available");
+    return;
+  }
+
+  const ctx = await createContext();
+  const session = await createSession(ctx);
+  try {
+    // Probing "<app execution alias>\.git" fails with EACCES instead of ENOTDIR.
+    await symlink(alias, path.join(ctx.cwd, "alias.exe"), "file");
+    const ui = configureTestUI(session, [], true);
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "normal.txt", content: "A\n" })]),
+      fauxAssistantMessage("A"),
+    ]);
+    await session.prompt("write A");
+    assert.equal(await readText(path.join(ctx.cwd, "normal.txt")), "A\n");
+    const tracked = await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "ls-files"));
+    assert.match(tracked.stdout, /^alias\.exe$/m);
+    assert.match(tracked.stdout, /^normal\.txt$/m);
+    assert.equal(ui.notifications.some(message => message.includes("Nested Git repository")), false);
+
+    await session.prompt("/undo");
+    assert.equal(await exists(path.join(ctx.cwd, "normal.txt")), false);
+    await session.prompt("/redo");
+    assert.equal(await readText(path.join(ctx.cwd, "normal.txt")), "A\n");
+  } finally {
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
 async function testRealGitAddTimeout(): Promise<void> {
   let filterCommand = "";
   let addFinished = false;
@@ -4390,6 +4440,7 @@ async function main(): Promise<void> {
     { name: "snapshot discovery honors nested ignores without scan limits", run: testSnapshotDiscoveryHonorsGitIgnoresWithoutScanLimit },
     { name: "real git add timeout", run: testRealGitAddTimeout },
     { name: "nested repository snapshot boundary", run: testNestedRepositorySnapshotBoundary },
+    { name: "inaccessible nested repository probe is skipped", run: testInaccessibleNestedRepositoryProbeIsSkipped },
     { name: "git timeout tracks process across reload", run: testGitTimeoutTracksProcessAcrossReload },
     { name: "tree unchanged files skip choice", run: testTreeUnchangedFilesSkipChoice },
     { name: "tree choice safety boundaries", run: testTreeChoiceSafetyBoundaries },

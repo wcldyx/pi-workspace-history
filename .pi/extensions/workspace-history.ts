@@ -1278,8 +1278,10 @@ async function findNestedRepositoryBoundaries(
         await access(path.join(ctx.cwd, relative, ".git"));
         repositories.push(relative);
       } catch (error) {
+        // Windows app execution aliases and unreadable entries report EACCES/EPERM;
+        // Git cannot treat them as repositories either.
         const code = (error as NodeJS.ErrnoException).code;
-        if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+        if (code !== "ENOENT" && code !== "ENOTDIR" && code !== "EACCES" && code !== "EPERM") throw error;
       }
     }));
   }
