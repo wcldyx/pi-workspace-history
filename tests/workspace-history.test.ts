@@ -3678,6 +3678,41 @@ async function testInaccessibleNestedRepositoryProbeIsSkipped(): Promise<void> {
   }
 }
 
+async function testSymlinkedNestedRepositoryIsExcluded(): Promise<void> {
+  const ctx = await createContext();
+  const session = await createSession(ctx);
+  try {
+    const nested = path.join(ctx.rootDir, "linked-target");
+    await initializeGitRepository(nested);
+    await writeFile(path.join(nested, "keep.txt"), "nested\n");
+    // Git lists the link itself, not a "dir/" entry, so the probe must not skip it as a file.
+    try {
+      await symlink(nested, path.join(ctx.cwd, "linked"), "dir");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+      console.log("  skipped: directory symlinks are not permitted");
+      return;
+    }
+    const ui = configureTestUI(session, [], true);
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "normal.txt", content: "A\n" })]),
+      fauxAssistantMessage("A"),
+    ]);
+    await session.prompt("write A");
+    const tracked = await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "ls-files", "--stage"));
+    assert.match(tracked.stdout, /\tnormal\.txt$/m);
+    assert.doesNotMatch(tracked.stdout, /linked/);
+    assert.equal(ui.notifications.filter(message => message.includes("\"linked\"") && message.includes("not included")).length, 1);
+
+    await session.prompt("/undo");
+    assert.equal(await exists(path.join(ctx.cwd, "normal.txt")), false);
+    assert.equal(await readText(path.join(ctx.cwd, "linked", "keep.txt")), "nested\n");
+  } finally {
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
 async function testRealGitAddTimeout(): Promise<void> {
   let filterCommand = "";
   let addFinished = false;
@@ -4441,6 +4476,7 @@ async function main(): Promise<void> {
     { name: "real git add timeout", run: testRealGitAddTimeout },
     { name: "nested repository snapshot boundary", run: testNestedRepositorySnapshotBoundary },
     { name: "inaccessible nested repository probe is skipped", run: testInaccessibleNestedRepositoryProbeIsSkipped },
+    { name: "symlinked nested repository is excluded", run: testSymlinkedNestedRepositoryIsExcluded },
     { name: "git timeout tracks process across reload", run: testGitTimeoutTracksProcessAcrossReload },
     { name: "tree unchanged files skip choice", run: testTreeUnchangedFilesSkipChoice },
     { name: "tree choice safety boundaries", run: testTreeChoiceSafetyBoundaries },

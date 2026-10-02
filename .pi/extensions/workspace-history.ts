@@ -20,6 +20,7 @@ import {
   rm as fsRm,
   readdir,
 } from "node:fs/promises";
+import type { Dirent } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import ignore, { type Ignore } from "ignore";
 import { homedir } from "node:os";
@@ -1260,18 +1261,51 @@ async function findNestedRepositoryBoundaries(
   candidates: string[],
   state?: RuntimeState,
 ): Promise<string[]> {
+  // Ancestor directories and Git's untracked directory entries ("dir/") are
+  // probed directly. Other entries are usually files, so read each parent
+  // directory once and probe only entries that turn out to be directories;
+  // probing every file is slow on network and WSL-mounted filesystems.
   const directories = new Set<string>();
+  const leaves = new Set<string>();
   for (const candidate of candidates) {
-    let relative = normalizeSnapshotPath(candidate).replace(/\/$/, "");
-    while (relative && relative !== ".") {
-      directories.add(relative);
-      const parent = path.posix.dirname(relative);
-      if (parent === relative) break;
+    const normalized = normalizeSnapshotPath(candidate);
+    let relative = normalized.replace(/\/$/, "");
+    if (!relative || relative === ".") continue;
+    (normalized.endsWith("/") ? directories : leaves).add(relative);
+    for (let parent = path.posix.dirname(relative); parent !== "." && parent !== relative; parent = path.posix.dirname(parent)) {
+      directories.add(parent);
       relative = parent;
     }
   }
+  const leavesByParent = new Map<string, string[]>();
+  for (const leaf of leaves) {
+    if (directories.has(leaf)) continue;
+    const parent = path.posix.dirname(leaf);
+    const siblings = leavesByParent.get(parent);
+    if (siblings) siblings.push(leaf);
+    else leavesByParent.set(parent, [leaf]);
+  }
+  const probes = new Set(directories);
+  const parents = [...leavesByParent.keys()];
+  for (let offset = 0; offset < parents.length; offset += 32) {
+    await Promise.all(parents.slice(offset, offset + 32).map(async parent => {
+      const children = leavesByParent.get(parent) ?? [];
+      let entries: Map<string, Dirent>;
+      try {
+        const dirents = await readdir(parent === "." ? ctx.cwd : path.join(ctx.cwd, parent), { withFileTypes: true });
+        entries = new Map(dirents.map(entry => [entry.name, entry]));
+      } catch {
+        for (const child of children) probes.add(child);
+        return;
+      }
+      for (const child of children) {
+        const entry = entries.get(path.posix.basename(child));
+        if (!entry || entry.isDirectory() || entry.isSymbolicLink()) probes.add(child);
+      }
+    }));
+  }
   const repositories: string[] = [];
-  const paths = [...directories];
+  const paths = [...probes];
   for (let offset = 0; offset < paths.length; offset += 32) {
     await Promise.all(paths.slice(offset, offset + 32).map(async relative => {
       try {
@@ -1589,7 +1623,6 @@ async function stageSnapshotFiles(pi: ExtensionAPI, ctx: ExtensionContext, state
   const startedAt = Date.now();
   await logLine(ctx, "stage snapshot start", state);
   const nestedRepositories = await findNestedRepositories(pi, ctx, state);
-  await pruneShadowIndexForIgnoreChanges(pi, ctx, state);
   if (nestedRepositories.length === 0) {
     await execGit(pi, ctx, await gitArgs(ctx, state, "add", "-A", "--", "."));
   } else {
@@ -1775,6 +1808,18 @@ async function warnMissingSnapshotCommit(
   );
 }
 
+// Equivalent to `git commit --allow-empty` for the staged shadow index, but
+// without the index refresh that stats every workspace file again.
+async function commitShadowIndex(pi: ExtensionAPI, ctx: ExtensionContext, message: string, state?: RuntimeState): Promise<string> {
+  const tree = await execGit(pi, ctx, await gitArgs(ctx, state, "write-tree"));
+  const head = await getHeadCommit(pi, ctx, state);
+  const commit = await execGit(pi, ctx, await gitCommitArgs(ctx, state, "commit-tree", tree, ...(head ? ["-p", head] : []), "-m", message));
+  await execGit(pi, ctx, await gitArgs(ctx, state, "update-ref", "HEAD", commit, ...(head ? [head] : [])));
+  // `git commit` ran automatic housekeeping; keep loose objects bounded.
+  await execGit(pi, ctx, await gitArgs(ctx, state, "gc", "--auto", "--quiet"));
+  return commit;
+}
+
 async function createSnapshotCommit(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -1787,7 +1832,6 @@ async function createSnapshotCommit(
     await logLine(ctx, `snapshot commit start label=${label} assumeDirty=${String(assumeDirty)}`, state);
     await assertWorkspaceHistoryEnabled(ctx, state, "createSnapshotCommit");
     await ensureShadowRepo(pi, ctx, state);
-    await pruneShadowIndexForIgnoreChanges(pi, ctx, state);
     if (!assumeDirty) {
       const currentHead = state?.lastKnownShadowHead ?? await getHeadCommit(pi, ctx, state);
       if (state && currentHead) {
@@ -1802,8 +1846,7 @@ async function createSnapshotCommit(
       }
     }
     await stageSnapshotFiles(pi, ctx, state);
-    await execGit(pi, ctx, [...(await gitCommitArgs(ctx, state, "commit", "--allow-empty", "-m", `[workspace-history] ${label}`))]);
-    const commit = await execGit(pi, ctx, await gitArgs(ctx, state, "rev-parse", "HEAD"));
+    const commit = await commitShadowIndex(pi, ctx, `[workspace-history] ${label}`, state);
     await retainSnapshotCommit(pi, ctx, commit, state);
     await touchWorkspaceAndSessionMeta(ctx, state);
     if (!label.startsWith("after ")) {
