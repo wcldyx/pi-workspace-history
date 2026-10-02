@@ -211,6 +211,7 @@ async function createSession(
   ctx: TestContext,
   sessionManager: SessionManager = SessionManager.inMemory(ctx.cwd),
   uiContext?: TestUIContext,
+  onExtensionError?: (error: string) => void,
 ) {
   const model = ctx.provider.getModel();
   const result = await createAgentSession({
@@ -247,6 +248,10 @@ async function createSession(
       },
     },
     onError: (err) => {
+      if (onExtensionError) {
+        onExtensionError(`${err.event}: ${String(err.error)}`);
+        return;
+      }
       throw new Error(`Extension error (${err.event}): ${err.error}\n${err.stack ?? ""}`);
     },
   });
@@ -3713,6 +3718,95 @@ async function testSymlinkedNestedRepositoryIsExcluded(): Promise<void> {
   }
 }
 
+async function testLaterPromptIsSentBeforeSnapshotFinishes(): Promise<void> {
+  const events: string[] = [];
+  let delayStatus = false;
+  const ctx = await createContext((pi) => {
+    const exec = pi.exec.bind(pi);
+    pi.exec = async (command, args, options) => {
+      if (command === "git" && args.includes("status") && delayStatus) {
+        delayStatus = false;
+        events.push("snapshot start");
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        const result = await exec(command, args, options);
+        events.push(`snapshot end file=${(await readFile(filePath, "utf8")).trim()}`);
+        return result;
+      }
+      return exec(command, args, options);
+    };
+    pi.on("agent_start", () => { events.push("agent start"); });
+    workspaceHistoryExtension(pi);
+  });
+  const filePath = path.join(ctx.cwd, "file.txt");
+  const session = await createSession(ctx);
+  try {
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "file.txt", content: "A\n" })]),
+      fauxAssistantMessage("A"),
+    ]);
+    await session.prompt("write A");
+    // A manual edit makes the second before snapshot record a new commit.
+    await writeFile(filePath, "manual\n");
+
+    events.length = 0;
+    delayStatus = true;
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "file.txt", content: "B\n" })]),
+      fauxAssistantMessage("B"),
+    ]);
+    await session.prompt("write B");
+    // The prompt goes out without waiting, but the write waits for the snapshot.
+    assert.deepEqual(events.filter(event => event !== "snapshot start"), ["agent start", "snapshot end file=manual"]);
+    assert.equal(await readText(filePath), "B\n");
+
+    await session.prompt("/undo");
+    assert.equal(await readText(filePath), "manual\n", "undo must restore the state captured before the tool ran");
+    await session.prompt("/redo");
+    assert.equal(await readText(filePath), "B\n");
+  } finally {
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
+async function testLaterPromptSnapshotFailureIsReported(): Promise<void> {
+  let failStatus = false;
+  const ctx = await createContext((pi) => {
+    const exec = pi.exec.bind(pi);
+    pi.exec = async (command, args, options) => {
+      if (command === "git" && args.includes("status") && failStatus) {
+        failStatus = false;
+        return { stdout: "", stderr: "simulated status failure", code: 1, killed: false };
+      }
+      return exec(command, args, options);
+    };
+    workspaceHistoryExtension(pi);
+  });
+  const errors: string[] = [];
+  const session = await createSession(ctx, undefined, undefined, error => errors.push(error));
+  try {
+    const filePath = path.join(ctx.cwd, "file.txt");
+    for (const value of ["A", "B", "C"]) {
+      failStatus = value === "B";
+      ctx.provider.setResponses([
+        fauxAssistantMessage([fauxToolCall("write", { path: "file.txt", content: `${value}\n` })]),
+        fauxAssistantMessage(value),
+      ]);
+      await session.prompt(`write ${value}`);
+      assert.equal(await readText(filePath), `${value}\n`, "a failed snapshot must not block the agent's tools");
+      if (value === "B") {
+        assert.equal(errors.length, 1, "the failure is reported once per prompt");
+        assert.match(errors[0], /^turn_end: .*simulated status failure/);
+      }
+    }
+    assert.equal(errors.length, 1);
+    assert.deepEqual((await readTurnSnapshots(session, ctx.cwd)).turns.map(turn => turn.promptText), ["write A", "write C"]);
+  } finally {
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
 async function testRealGitAddTimeout(): Promise<void> {
   let filterCommand = "";
   let addFinished = false;
@@ -4473,6 +4567,8 @@ async function main(): Promise<void> {
     { name: "snapshot ignores global signing", run: testSnapshotIgnoresGlobalSigning },
     { name: "restore timeout waits before rollback", run: testRestoreTimeoutWaitsBeforeRollback },
     { name: "snapshot discovery honors nested ignores without scan limits", run: testSnapshotDiscoveryHonorsGitIgnoresWithoutScanLimit },
+    { name: "later prompt is sent before snapshot finishes", run: testLaterPromptIsSentBeforeSnapshotFinishes },
+    { name: "later prompt snapshot failure is reported", run: testLaterPromptSnapshotFailureIsReported },
     { name: "real git add timeout", run: testRealGitAddTimeout },
     { name: "nested repository snapshot boundary", run: testNestedRepositorySnapshotBoundary },
     { name: "inaccessible nested repository probe is skipped", run: testInaccessibleNestedRepositoryProbeIsSkipped },

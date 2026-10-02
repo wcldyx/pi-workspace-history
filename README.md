@@ -122,6 +122,10 @@ For restore commands that change workspace files, a timeout waits for the comman
 
 A single undo unit lasts from the original prompt until Pi reports that the agent is settled. Intermediate tool rounds receive their own tree anchors, but queued input never replaces the operation's original prompt or `before` snapshot. One `/undo` therefore removes the complete result of a multi-round operation, and `/redo` restores it as a unit.
 
+After the first prompt of a session, a prompt is sent without waiting for its `before` snapshot. The snapshot runs while the model responds, and the agent's first tool call waits until it is complete, so undo still restores the files as they were before the operation. The first prompt still waits, because the baseline snapshot must be recorded ahead of it. If the `before` snapshot fails, the error is reported when the turn ends and the operation is not added to the undo history.
+
+On WSL2, Git is much slower on Windows drives (`/mnt/c`, `/mnt/d`, ...) than on the Linux filesystem, which makes snapshots slower too. Keeping projects in the Linux filesystem (for example under `~`) is recommended.
+
 For conversation-only navigation without a branch summary, the plugin first resolves any pending recovery from an earlier interrupted restore. If files changed after that interrupted restore, those later edits are kept automatically. The plugin then snapshots the current files before moving the conversation and uses the snapshot as the seed of the continued history branch. Once the conversation continues, its normal visible message nodes restore that kept workspace state through `/tree`. Cancelling the choice leaves both conversation and workspace unchanged. In non-interactive modes, navigation keeps the previous combined conversation-and-workspace behavior.
 
 Default snapshot scope:
@@ -256,6 +260,7 @@ npm run typecheck
 
 ## Recent Changes
 
+- Prompts are sent without waiting for the workspace snapshot, and each snapshot scans the workspace fewer times
 - Git, Jujutsu, and colocated repositories share the same file-history workflow while their VCS metadata remains untouched
 - Complete multi-round agent operations now form one undo/redo unit
 - Hard exclusions remain unmanaged even when `.gitignore` contains negation rules

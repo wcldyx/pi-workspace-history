@@ -136,6 +136,12 @@ interface MultiRepoContainerCache {
   isContainer: boolean;
 }
 
+interface BeforeSnapshotGate {
+  promise: Promise<void>;
+  error?: unknown;
+  reported?: boolean;
+}
+
 interface RuntimeState {
   warnedNestedRepositories?: Set<string>;
   pendingTurnId?: string;
@@ -172,6 +178,7 @@ interface RuntimeState {
   cachedExcludeSource?: string;
   snapshotWritePromise?: Promise<unknown>;
   beforeSnapshotPromise?: Promise<void>;
+  beforeSnapshotGate?: BeforeSnapshotGate;
   turnSnapshots?: TurnSnapshotState;
   disabledNoticeReason?: string;
   lastIndexPruneIgnoreSource?: string;
@@ -2296,6 +2303,10 @@ function getTreeNavigationResultLeafId(
   return target.id;
 }
 
+function hasBaselineSnapshotEntry(ctx: ExtensionContext): boolean {
+  return getSnapshotEntries(ctx).some((entry) => hasSnapshotData(entry) && entry.data.kind === "baseline");
+}
+
 function getSnapshotEntries(ctx: ExtensionContext): Array<CustomEntry<WorkspaceSnapshot>> {
   return getEntries(ctx).filter(isSnapshotEntry);
 }
@@ -3013,6 +3024,9 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       return;
     }
 
+    // The prompt may be appended while the snapshot runs, so record where
+    // this operation starts now rather than when the snapshot finishes.
+    const operationStartLeafId = ctx.sessionManager.getLeafId();
     const beforeSnapshotPromise = (async () => {
       if (!await tryRecoverPendingWorkspace(pi, ctx, state, "New turn")) {
         throw new Error("workspace recovery is incomplete");
@@ -3023,7 +3037,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       await clearRedoStack(ctx, state);
 
       const turnId = randomUUID();
-      const hasBaseline = getSnapshotEntries(ctx).some((entry) => hasSnapshotData(entry) && entry.data.kind === "baseline");
+      const hasBaseline = hasBaselineSnapshotEntry(ctx);
       const isFirstSnapshot = !hasBaseline;
       let commit: string;
 
@@ -3077,7 +3091,9 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
       state.pendingTurnId = turnId;
       state.pendingBeforeCommit = commit;
-      state.pendingOperationStartLeafId = ctx.sessionManager.getLeafId();
+      // The first snapshot blocks the prompt and appends the baseline entry,
+      // which must not become part of this operation.
+      state.pendingOperationStartLeafId = isFirstSnapshot ? ctx.sessionManager.getLeafId() : operationStartLeafId;
       state.pendingOriginalUserEntryId = undefined;
       state.pendingNavigationSnapshots = [];
       state.pendingAnchoredEntryIds = new Set<string>();
@@ -3086,7 +3102,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
       await logLine(
         ctx,
-        `create before snapshot turn=${turnId} commit=${commit} leaf=${ctx.sessionManager.getLeafId()} ${elapsedMs(startedAt)}ms`,
+        `create before snapshot turn=${turnId} commit=${commit} leaf=${operationStartLeafId} ${elapsedMs(startedAt)}ms`,
         state,
       );
     })();
@@ -3101,6 +3117,32 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         state.beforeSnapshotPromise = undefined;
         state.pendingBeforeSnapshotPrompt = undefined;
       }
+    }
+  }
+
+  // The prompt is sent while the before snapshot is still being taken. Tool
+  // calls and turn bookkeeping wait for it, so the agent cannot change the
+  // workspace before the snapshot has captured it.
+  function startBeforeSnapshotForTurn(ctx: ExtensionContext, state: RuntimeState, promptText?: string): void {
+    const gate: BeforeSnapshotGate = { promise: Promise.resolve() };
+    gate.promise = ensureBeforeSnapshotForTurn(ctx, state, promptText).catch(async (error: unknown) => {
+      gate.error = error;
+      await logLine(ctx, `before snapshot failed error=${String(error)}`, state).catch(() => undefined);
+    });
+    state.beforeSnapshotGate = gate;
+  }
+
+  // Errors are reported once, through a handler that does not block tools,
+  // matching how a failed before_agent_start handler was reported.
+  async function waitForBeforeSnapshot(state: RuntimeState, reportError = false): Promise<void> {
+    const gate = state.beforeSnapshotGate;
+    if (!gate) {
+      return;
+    }
+    await gate.promise;
+    if (reportError && gate.error !== undefined && !gate.reported) {
+      gate.reported = true;
+      throw gate.error;
     }
   }
 
@@ -3249,6 +3291,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.baselineWarmupInProgress = false;
     state.snapshotWritePromise = undefined;
     state.beforeSnapshotPromise = undefined;
+    state.beforeSnapshotGate = undefined;
     state.reusableRepoUpdatePromise = undefined;
     state.disabledNoticeReason = undefined;
     state.initializationNoticeShown = false;
@@ -3281,6 +3324,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (_event, ctx) => {
     const state = getState(ctx);
+    await waitForBeforeSnapshot(state);
     await state.reusableRepoUpdatePromise?.catch(() => undefined);
     await releaseSessionLease(ctx, state);
   });
@@ -3315,7 +3359,12 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     if (!state.pendingTurnId && !state.pendingBeforeCommit) {
       state.pendingPromptText = event.prompt;
     }
-    await ensureBeforeSnapshotForTurn(ctx, state, event.prompt);
+    startBeforeSnapshotForTurn(ctx, state, event.prompt);
+    if (!hasBaselineSnapshotEntry(ctx)) {
+      // The baseline entry must precede the prompt in the session, so the
+      // first snapshot still holds the prompt back.
+      await waitForBeforeSnapshot(state, true);
+    }
     await logLine(ctx, `before_agent_start done ${elapsedMs(startedAt)}ms`, state);
   });
 
@@ -3329,12 +3378,22 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     if (isSlashCommandPrompt(state.pendingPromptText)) {
       return;
     }
-    await ensureBeforeSnapshotForTurn(ctx, state, state.pendingPromptText);
+    if (state.beforeSnapshotGate?.error !== undefined) {
+      // A later turn would capture the agent's own edits as the "before" state.
+      await logLine(ctx, "turn_start skipped before snapshot retry after failure", state);
+      return;
+    }
+    startBeforeSnapshotForTurn(ctx, state, state.pendingPromptText);
     await logLine(ctx, `turn_start done ${elapsedMs(startedAt)}ms`, state);
+  });
+
+  pi.on("tool_call", async (_event, ctx) => {
+    await waitForBeforeSnapshot(getState(ctx));
   });
 
   pi.on("turn_end", async (event, ctx) => {
     const state = getState(ctx);
+    await waitForBeforeSnapshot(state, true);
     try {
       if (!await ensureWorkspaceHistoryAvailable(ctx, state, "turn_end")) {
         clearPendingAgentOperation(state);
@@ -3357,6 +3416,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
   pi.on("session_compact", async (event, ctx) => {
     const state = getState(ctx);
+    await waitForBeforeSnapshot(state);
     if (!state.pendingTurnId || !state.pendingBeforeCommit) {
       return;
     }
@@ -3398,11 +3458,13 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
   pi.on("agent_settled", async (_event, ctx) => {
     const state = getState(ctx);
     try {
+      await waitForBeforeSnapshot(state, true);
       if (await ensureWorkspaceHistoryAvailable(ctx, state, "agent_settled")) {
         await capturePendingAgentOperation(ctx, state, "agent_settled");
       }
     } finally {
       clearPendingAgentOperation(state);
+      state.beforeSnapshotGate = undefined;
     }
   });
 
