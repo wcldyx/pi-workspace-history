@@ -260,6 +260,7 @@ npm run typecheck
 
 ## 最近更新
 
+- 文件有改动时，快照只暂存改动的文件，不再重新扫描整个工作区
 - 发送 prompt 不再等待工作区快照，每次快照扫描工作区的次数也更少
 - Git、Jujutsu 和 colocated 仓库共用同一套文件历史流程，同时保持各自的 VCS 元数据不变
 - 完整的多轮 Agent 操作现在作为一个 undo / redo 单元

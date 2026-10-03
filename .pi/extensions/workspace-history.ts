@@ -43,6 +43,7 @@ const MULTI_REPO_SCAN_MAX_DIRS = 256;
 const MULTI_REPO_SCAN_MAX_MS = 250;
 const MULTI_REPO_SCAN_BATCH_SIZE = 16;
 const MULTI_REPO_SCAN_CACHE_MS = 30_000;
+const MAX_CHANGED_PATHS_TO_STAGE = 1_000;
 const PROJECT_MARKER_FILES = [
   ".git",
   ".jj",
@@ -165,6 +166,9 @@ interface RuntimeState {
   reusableRepoUpdatePromise?: Promise<void>;
   lastCleanupAt?: number;
   lastKnownShadowHead?: string;
+  // Paths from the latest `git status` against HEAD; only these can differ
+  // between the shadow index and the workspace while HEAD is unchanged.
+  lastStatusChanges?: { head: string; paths: string[] };
   initialSnapshotCommit?: string;
   warmedBaselineCommit?: string;
   pendingBeforeSnapshotPrompt?: string;
@@ -1626,9 +1630,43 @@ async function pruneShadowIndexForIgnoreChanges(pi: ExtensionAPI, ctx: Extension
 }
 
 
-async function stageSnapshotFiles(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
+// Stages only paths that `git status` reported, so `git add` does not stat the
+// whole workspace again. Returns false when the caller must stage everything.
+async function stageChangedSnapshotPaths(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  changedPaths: string[],
+  state?: RuntimeState,
+): Promise<boolean> {
+  if (changedPaths.length > MAX_CHANGED_PATHS_TO_STAGE) {
+    return false;
+  }
+  const paths = await getWorkspaceStoragePaths(ctx, state);
+  const pathspecFile = path.join(paths.sessionRoot, `changed-${randomUUID()}.txt`);
+  try {
+    const pathspecs = changedPaths.map(changedPath => `:(top,literal)${normalizeSnapshotPath(changedPath).replace(/\/$/, "")}`);
+    await writeFile(pathspecFile, pathspecs.join("\0") + "\0");
+    const result = await runGitCommand(pi, ctx, await gitArgs(ctx, state, "add", "-A", "--pathspec-from-file", pathspecFile, "--pathspec-file-nul"), state);
+    if (result.code !== 0) {
+      // A path may have vanished since `git status`; rescan the workspace.
+      await logLine(ctx, `stage changed paths failed count=${changedPaths.length} error=${result.stderr || result.stdout}`, state);
+      return false;
+    }
+    return true;
+  } finally {
+    await unlink(pathspecFile).catch(() => undefined);
+  }
+}
+
+async function stageSnapshotFiles(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState, changedPaths?: string[]): Promise<void> {
   const startedAt = Date.now();
-  await logLine(ctx, "stage snapshot start", state);
+  await logLine(ctx, `stage snapshot start changed=${changedPaths?.length ?? "all"}`, state);
+  if (changedPaths && await stageChangedSnapshotPaths(pi, ctx, changedPaths, state)) {
+    await logLine(ctx, `stage snapshot git-add changed done ${elapsedMs(startedAt)}ms`, state);
+    await pruneShadowIndexForIgnoreChanges(pi, ctx, state);
+    await logLine(ctx, `stage snapshot done ${elapsedMs(startedAt)}ms`, state);
+    return;
+  }
   const nestedRepositories = await findNestedRepositories(pi, ctx, state);
   if (nestedRepositories.length === 0) {
     await execGit(pi, ctx, await gitArgs(ctx, state, "add", "-A", "--", "."));
@@ -1647,9 +1685,9 @@ async function stageSnapshotFiles(pi: ExtensionAPI, ctx: ExtensionContext, state
   await logLine(ctx, `stage snapshot done ${elapsedMs(startedAt)}ms`, state);
 }
 
-async function hasWorkspaceChanges(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<boolean> {
+async function listWorkspaceChanges(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<string[]> {
   const startedAt = Date.now();
-  await assertWorkspaceHistoryEnabled(ctx, state, "hasWorkspaceChanges");
+  await assertWorkspaceHistoryEnabled(ctx, state, "listWorkspaceChanges");
   await ensureShadowRepo(pi, ctx, state);
 
   const statusResult = await runGitCommand(pi, ctx, await gitArgs(ctx, state, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "."), state);
@@ -1657,10 +1695,13 @@ async function hasWorkspaceChanges(pi: ExtensionAPI, ctx: ExtensionContext, stat
     throw new Error(statusResult.stderr || statusResult.stdout || "git status failed");
   }
 
-  const changedPaths = parsePorcelainStatusPaths(statusResult.stdout);
-  const changed = (await filterSnapshotPaths(ctx, changedPaths, state)).length > 0;
-  await logLine(ctx, `workspace changes check done ${elapsedMs(startedAt)}ms changed=${String(changed)}`, state);
-  return changed;
+  const changedPaths = await filterSnapshotPaths(ctx, parsePorcelainStatusPaths(statusResult.stdout), state);
+  await logLine(ctx, `workspace changes check done ${elapsedMs(startedAt)}ms changed=${changedPaths.length}`, state);
+  return changedPaths;
+}
+
+async function hasWorkspaceChanges(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<boolean> {
+  return (await listWorkspaceChanges(pi, ctx, state)).length > 0;
 }
 
 async function getHeadCommit(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<string | undefined> {
@@ -1839,12 +1880,23 @@ async function createSnapshotCommit(
     await logLine(ctx, `snapshot commit start label=${label} assumeDirty=${String(assumeDirty)}`, state);
     await assertWorkspaceHistoryEnabled(ctx, state, "createSnapshotCommit");
     await ensureShadowRepo(pi, ctx, state);
+    let changedPaths: string[] | undefined;
+    const statusChanges = state?.lastStatusChanges;
+    if (state) {
+      state.lastStatusChanges = undefined;
+    }
+    if (assumeDirty && statusChanges && statusChanges.head === await getHeadCommit(pi, ctx, state)) {
+      changedPaths = statusChanges.paths;
+    }
     if (!assumeDirty) {
       const currentHead = state?.lastKnownShadowHead ?? await getHeadCommit(pi, ctx, state);
       if (state && currentHead) {
         state.lastKnownShadowHead = currentHead;
       }
-      if (currentHead && !await hasWorkspaceChanges(pi, ctx, state)) {
+      if (currentHead) {
+        changedPaths = await listWorkspaceChanges(pi, ctx, state);
+      }
+      if (currentHead && changedPaths?.length === 0) {
         await retainSnapshotCommit(pi, ctx, currentHead, state);
         await touchWorkspaceAndSessionMeta(ctx, state);
         scheduleCleanup(ctx, state);
@@ -1852,7 +1904,7 @@ async function createSnapshotCommit(
         return currentHead;
       }
     }
-    await stageSnapshotFiles(pi, ctx, state);
+    await stageSnapshotFiles(pi, ctx, state, changedPaths);
     const commit = await commitShadowIndex(pi, ctx, `[workspace-history] ${label}`, state);
     await retainSnapshotCommit(pi, ctx, commit, state);
     await touchWorkspaceAndSessionMeta(ctx, state);
@@ -1904,6 +1956,7 @@ async function restoreSnapshotCommit(pi: ExtensionAPI, ctx: ExtensionContext, co
   }
   if (state) {
     state.lastKnownShadowHead = restoredCommit;
+    state.lastStatusChanges = undefined;
     state.lastExcludedWorkspacePaths = protectedPaths;
   }
   return restoredCommit;
@@ -1946,6 +1999,7 @@ async function realignShadowRepoAfterFailedRollback(
   await execGit(pi, ctx, await gitArgs(ctx, state, "reset", "--mixed", "--no-refresh", commit));
   if (state) {
     state.lastKnownShadowHead = commit;
+    state.lastStatusChanges = undefined;
   }
 }
 
@@ -2719,7 +2773,11 @@ async function isWorkspaceDirtyAgainstCommit(
     state.lastKnownShadowHead = headCommit;
   }
   if (headCommit === commit) {
-    const changed = await hasWorkspaceChanges(pi, ctx, state);
+    const changedPaths = await listWorkspaceChanges(pi, ctx, state);
+    const changed = changedPaths.length > 0;
+    if (state) {
+      state.lastStatusChanges = { head: commit, paths: changedPaths };
+    }
     await logLine(ctx, `dirty against commit via status ${elapsedMs(startedAt)}ms commit=${commit} changed=${String(changed)}`, state);
     return changed ? "dirty" : "clean";
   }

@@ -260,6 +260,7 @@ npm run typecheck
 
 ## Recent Changes
 
+- Snapshots after file changes stage only the changed files instead of rescanning the whole workspace
 - Prompts are sent without waiting for the workspace snapshot, and each snapshot scans the workspace fewer times
 - Git, Jujutsu, and colocated repositories share the same file-history workflow while their VCS metadata remains untouched
 - Complete multi-round agent operations now form one undo/redo unit

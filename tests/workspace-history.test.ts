@@ -1,4 +1,4 @@
-import { access, copyFile, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdtemp, mkdir, readFile, readdir, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
@@ -3718,6 +3718,97 @@ async function testSymlinkedNestedRepositoryIsExcluded(): Promise<void> {
   }
 }
 
+async function testSnapshotStagesOnlyChangedPaths(): Promise<void> {
+  const adds: string[] = [];
+  let failChangedAdd = false;
+  const ctx = await createContext((pi) => {
+    const exec = pi.exec.bind(pi);
+    pi.exec = async (command, args, options) => {
+      if (command === "git" && args.includes("add")) {
+        const changed = args.some(arg => path.basename(arg).startsWith("changed-"));
+        adds.push(changed ? "changed" : "all");
+        if (changed && failChangedAdd) {
+          failChangedAdd = false;
+          return { stdout: "", stderr: "simulated add failure", code: 1, killed: false };
+        }
+      }
+      return exec(command, args, options);
+    };
+    workspaceHistoryExtension(pi);
+  });
+  await writeFile(path.join(ctx.cwd, ".gitignore"), "ignored.txt\n");
+  await writeFile(path.join(ctx.cwd, "edit.txt"), "old\n");
+  await writeFile(path.join(ctx.cwd, "gone.txt"), "gone\n");
+  await mkdir(path.join(ctx.cwd, "dir"));
+  await writeFile(path.join(ctx.cwd, "dir", "old-name.txt"), "move\n");
+  const session = await createSession(ctx);
+  const shadowFiles = async () => (await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "ls-tree", "-r", "-z", "--name-only", "HEAD"))).stdout
+    .split("\0").filter(Boolean).sort();
+  const shadowText = async (relativePath: string) => (await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "show", `HEAD:${relativePath}`))).stdout;
+  try {
+    configureTestUI(session, [], true);
+    ctx.provider.setResponses([fauxAssistantMessage("hi")]);
+    await session.prompt("hi");
+    const baseline = await shadowFiles();
+    assert.ok(baseline.includes("gone.txt") && baseline.includes("dir/old-name.txt"));
+
+    await writeFile(path.join(ctx.cwd, "edit.txt"), "new\n");
+    await rm(path.join(ctx.cwd, "gone.txt"));
+    await rename(path.join(ctx.cwd, "dir", "old-name.txt"), path.join(ctx.cwd, "dir", "new-name.txt"));
+    await mkdir(path.join(ctx.cwd, "new dir"));
+    await writeFile(path.join(ctx.cwd, "new dir", "space file.txt"), "space\n");
+    await writeFile(path.join(ctx.cwd, "ignored.txt"), "ignored\n");
+    const nested = path.join(ctx.cwd, "nested");
+    await initializeGitRepository(nested);
+    await writeFile(path.join(nested, "inner.txt"), "inner\n");
+    adds.length = 0;
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "agent.txt", content: "agent\n" })]),
+      fauxAssistantMessage("done"),
+    ]);
+    await session.prompt("write agent");
+    assert.deepEqual(adds, ["changed", "changed"], "before and after snapshots stage only reported paths");
+    const expected = [...baseline.filter(file => file !== "gone.txt" && file !== "dir/old-name.txt"), "agent.txt", "dir/new-name.txt", "new dir/space file.txt"].sort();
+    assert.deepEqual(await shadowFiles(), expected);
+    assert.equal(await shadowText("edit.txt"), "new\n");
+
+    await session.prompt("/undo");
+    assert.equal(await exists(path.join(ctx.cwd, "agent.txt")), false);
+    assert.equal(await readText(path.join(ctx.cwd, "edit.txt")), "new\n");
+    assert.equal(await readText(path.join(ctx.cwd, "dir", "new-name.txt")), "move\n");
+    assert.equal(await exists(path.join(ctx.cwd, "gone.txt")), false);
+    assert.equal(await readText(path.join(nested, "inner.txt")), "inner\n");
+
+    // After a restore the shadow HEAD moves, so status paths from before it are unusable.
+    adds.length = 0;
+    ctx.provider.setResponses([fauxAssistantMessage([fauxToolCall("write", { path: "agent.txt", content: "again\n" })]), fauxAssistantMessage("again")]);
+    await session.prompt("write again");
+    assert.deepEqual(adds, ["all", "changed"]);
+    assert.equal(await shadowText("agent.txt"), "again\n");
+
+    await writeFile(path.join(ctx.cwd, "edit.txt"), "fallback\n");
+    failChangedAdd = true;
+    adds.length = 0;
+    ctx.provider.setResponses([fauxAssistantMessage("fallback")]);
+    await session.prompt("fallback");
+    assert.deepEqual(adds, ["changed", "all"], "a failed partial add falls back to staging everything");
+    assert.equal(await shadowText("edit.txt"), "fallback\n");
+
+    await mkdir(path.join(ctx.cwd, "bulk"));
+    for (let index = 0; index <= 1000; index += 1) {
+      await writeFile(path.join(ctx.cwd, "bulk", `file-${index}.txt`), `${index}\n`);
+    }
+    adds.length = 0;
+    ctx.provider.setResponses([fauxAssistantMessage("bulk")]);
+    await session.prompt("bulk");
+    assert.deepEqual(adds, ["all"], "many changed paths stage the whole workspace");
+    assert.equal(await shadowText("bulk/file-1000.txt"), "1000\n");
+  } finally {
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
 async function testLaterPromptIsSentBeforeSnapshotFinishes(): Promise<void> {
   const events: string[] = [];
   let delayStatus = false;
@@ -4567,6 +4658,7 @@ async function main(): Promise<void> {
     { name: "snapshot ignores global signing", run: testSnapshotIgnoresGlobalSigning },
     { name: "restore timeout waits before rollback", run: testRestoreTimeoutWaitsBeforeRollback },
     { name: "snapshot discovery honors nested ignores without scan limits", run: testSnapshotDiscoveryHonorsGitIgnoresWithoutScanLimit },
+    { name: "snapshot stages only changed paths", run: testSnapshotStagesOnlyChangedPaths },
     { name: "later prompt is sent before snapshot finishes", run: testLaterPromptIsSentBeforeSnapshotFinishes },
     { name: "later prompt snapshot failure is reported", run: testLaterPromptSnapshotFailureIsReported },
     { name: "real git add timeout", run: testRealGitAddTimeout },
