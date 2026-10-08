@@ -2818,7 +2818,8 @@ function findAfterSnapshotForMessageAnchor(
   }
   // Earlier versions anchored Pi 1.x's pre-prompt system entry to the
   // operation that followed it.
-  if ((entry as SessionMessageEntry & { message: { role: string } }).message.role === "system") {
+  const role: string = (entry as SessionMessageEntry).message.role;
+  if (role === "system") {
     return undefined;
   }
 
