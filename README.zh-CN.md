@@ -2,169 +2,76 @@
 
 [English version](./README.md)
 
-给 Pi 补上真正可用的工作区级 Undo / Redo。
-
-把接近 OpenCode 的 `/undo` 体验带给 Pi，并补上类似 Claude Code 那种让人敢放心改代码的工作区回退安全感。
+[Pi 编码代理](https://pi.dev) 的撤销功能。Agent 改坏了东西，输入 `/undo`，文件和对话一起回到这条提示词之前，一步到位。
 
 ![workspace-history 演示](./demo.gif)
 
-## 为什么值得用
+## 快速上手
 
-- 撤销的是整个工作区，不只是聊天记录
-- 让你敢放心让 Agent 真改代码
-- 通过 `/tree` 恢复历史分支对应的工作区状态
-- 只回退对话上下文时保留当前文件
-- 通过 `/checkpoint` 保护手动修改
-
-## 这是什么
-
-`workspace-history` 是一个面向 `@earendil-works/pi-coding-agent` 0.84.4 及以上版本的工作区历史插件，需要 Node.js 22.19.0 或更高版本。
-
-它不是单纯给 `pi` 增加一个 `/undo` 命令，而是要协调聊天历史与本地工作区的真实状态，同时允许用户选择是否随导航恢复文件。
-
-它的核心目标是：
-
-```text
-当用户在历史聊天树中切换到任意节点时，
-可以同时恢复聊天上下文和工作区文件状态，
-也可以只回退对话并保留当前文件。
+```bash
+pi install npm:pi-workspace-history       # 所有项目可用
+pi install -l npm:pi-workspace-history    # 只装到当前项目（.pi/settings.json）
+pi -e npm:pi-workspace-history            # 不安装，只在本次运行中试用
 ```
 
-换句话说：
+在项目目录里启动 `pi`，底栏出现 `⟲ history` 就表示已生效。照常使用 Pi，Agent 改坏了就输入 `/undo`。
 
-- `/tree` 是真正的时间机器
-- `/undo` 是沿着 `/tree` 向后导航一步的快捷命令
-- `/redo` 是回到刚才撤销前位置的快捷命令
+要求：Pi 0.84.4 或更高（已在 0.84.4、1.0.4 和 1.1.0 上测试）、Node.js 22.19.0 或更高，并且 `PATH` 中有 `git`。项目本身不必是 Git 仓库。
 
-## 这个插件有什么用
+## 命令
 
-在使用 Agent 编程时，经常会遇到这些问题：
+| 命令 | 作用 |
+|---|---|
+| `/undo` | 回到上一次 Agent 操作之前：文件和对话一起（或只回退对话），并把原提示词放回输入框 |
+| `/redo` | 把 `/undo` 刚撤掉的内容恢复回来 |
+| `/tree` / 双击 Esc | 跳到对话中的任意位置，并选择文件是否一起恢复 |
+| `/diff [n]` | 查看最近一次 Agent 操作改了什么（`/diff 2` 看再前一次） |
+| `/checkpoint [label]` | 保存当前文件，比如手动修改之前 |
+| `/history-status` | 查看历史功能是否生效、存储位置、被跳过的文件和最近的错误 |
 
-- Agent 改坏了代码
-- Agent 误删了文件
-- Agent 创建了很多无用文件
-- 你想回到某个历史节点重新探索另一条路线
-- 你在两轮 Agent 之间手动改过代码、创建过文件、删掉过文件
-- 你不希望错误上下文继续污染后续推理
+`/undo` 只问一个问题（文件和对话一起，还是只回退对话），其余自动完成，`/redo` 沿用同一个选择。`/diff` 是单独的只读命令，查看改动不会给撤销多加一步。
 
-这个插件解决的不是“单步撤销文本编辑”，而是协调整个工作区快照与聊天历史导航，也支持保留当前文件的纯对话回退。
+## 撤销能覆盖什么
 
-它的价值在于：
+- **整次操作。** 从你发出提示词到 Agent 结束，算作一个单位：所有工具轮次、自动重试、上下文压缩，以及运行中你追加的消息。一次 `/undo` 全部撤掉。
+- **所有文件改动。** Agent 修改、新建、删除、重命名的文件，包括通过 Shell 命令做的改动。
+- **你自己的修改不会丢。** 两次提示词之间的手动修改，会在下一条提示词发出前保存。如果工作区里有还没保存进历史的修改，恢复文件的操作会被拒绝，而不是覆盖它们。可以先用 `/checkpoint` 保存，或者选择"只回退对话"。
+- **不碰你的仓库。** 历史保存在项目外的一个私有 Git 仓库里。你的提交、分支、暂存区、stash、refs 以及 Jujutsu 的操作记录都不会被改动；撤销只恢复文件内容，所以 `git status` 会把恢复的文件显示为修改。
 
-- 让 `/undo` 真正撤销一整轮 Agent 的结果，而不只是恢复一部分文件
-- 让 `/tree` 不只是切换聊天视图，还能同步恢复工作区
-- 让你安全地在历史分支之间来回切换
-- 保留用户在 Agent 回合之间的手动修改语义
-- 避免把插件内部状态污染进用户项目自己的 Git 历史
+不会处理的内容：
 
-## 具体诉求
+- 被你的 `.gitignore` 忽略的路径，以及下面这些路径，它们永远不会被保存或覆盖：`.git/`、`.jj/`、`node_modules/`、`dist/`、`build/`、`.cache/`、`.next/`、`.turbo/`、`coverage/`、`.env`、`.env.*`、`.pi/workspace-history/`。即使 `.gitignore` 写了 `!.env.local` 这样的反向规则，也不会把它们加回来。
+- 超过 10 MB 的新文件。会提示一次，撤销和重做都不会动它们。已经在历史中的文件不受大小限制。
+- 嵌套的 Git 仓库（包括 worktree）。每个只提示一次；要管理它的历史，请在那个仓库里打开 Pi。
+- 文件权限。在 Linux 和 macOS 上，有可执行权限的文件恢复后仍然可执行；但只改权限的操作（例如 `chmod +x`）不会被撤销，恢复时重新创建的文件也没有可执行权限。
+- 工作区以外的一切：部署、API 调用、数据库。
 
-这个插件围绕下面这些明确诉求设计：
+## 常见问题
 
-1. 每轮 Agent 开始前，记录一份 `before` 快照。
-2. 每轮 Agent 完成后，记录一份 `after` 快照。
-3. 用户通过 `/tree` 或 `/undo` 导航时，可以选择同时恢复对话和工作区，或只回退对话。
-4. 选择恢复工作区时，`/undo` 应恢复“这一轮开始前的真实状态”，而不是简单回到上一轮 Agent 完成后的状态。
-5. 如果用户在两轮 Agent 之间手动删了文件、改了代码、建了新文件，这些变化在下一轮开始前应被记录进 `before snapshot`。
-6. 如果当前工作区有尚未快照的手动修改，恢复工作区时不能默默覆盖；只回退对话时则自动保存并锚定这些修改。
-7. 插件自己的内部状态应该和用户项目主 Git 历史隔离，不能污染用户仓库。
-8. 多个 session 之间的快照和 redo 状态应该相互隔离，不能串台。
+**能只撤回对话、保留文件吗？**
+可以。`/undo` 和 `/tree` 都提供"只回退对话（保留当前文件）"。当前文件会先被保存，之后仍然可以回到这个状态。
 
-## 主要功能
+**撤销错了还能恢复吗？**
+可以，用 `/redo`。
 
-- `/undo`
-  - 可选择同时恢复对话和工作区，或只回退对话
-  - 第一项默认保持原有的同步恢复行为
-  - 把该轮用户 prompt 放回输入框，方便修改后重试
-  - 把原始 prompt、全部工具轮次、自动重试、compaction continuation，以及排队的 `steer` / `followUp` 输入视为同一个操作
+**和 Pi 自带的 `/tree` 有什么区别？**
+Pi 自带的 `/tree` 只移动对话。装了本插件后，`/tree` 还能把文件恢复到所选位置对应的状态。如果那个位置的文件和现在一样，就不再询问。
 
-- `/redo`
-  - 回到刚才 `/undo` 之前的位置
-  - 自动沿用 `/undo` 选择的模式，不重复询问
+**`/fork` 呢？**
+`/fork` 会把对话复制到一个新会话，文件保持不变。新会话的历史从空开始：原会话里的操作在新会话中不能撤销，之后的新操作可以撤销。如果要把文件恢复到之前的某个位置，请在原会话里用 `/tree` 或 `/undo`。
 
-- `/checkpoint [label]`
-  - 保存当前工作区为一个手动检查点
-  - 用于保护尚未发送新 prompt 的手动修改
+**大仓库或 WSL 上会慢吗？**
+发送提示词不会等待快照，详见[性能](#性能)。在 WSL 上，建议把项目放在 Linux 文件系统里，不要放在 `/mnt/c` 下。
 
-- 基于 `/tree` 的工作区恢复
-  - 当前与目标快照均可用、当前纳管文件没有未快照修改，且两份快照的纳管内容一致时，省略模式选择，保留文件并锚定到新分支。工作区干净本身不代表旧快照的文件与当前相同。
-  - 其他情况仍保留选择；普通交互式树导航会说明目标文件不同、当前有未快照修改或无法完成比较。分支摘要和待恢复状态沿用现有流程。
-  - 选定历史节点后，可选择是否恢复对应的工作区状态
-  - 同时覆盖 `/tree` 和 Pi 的双击 `Esc` 历史树入口
-  - 支持在不同历史分支之间来回切换
-  - 选择“只回退对话”时支持生成分支摘要；请求摘要时仍会阻止“同时恢复工作区”，因为摘要生成可能在对话切换完成前被取消
-  - 如果此前中断的恢复仍待处理，摘要导航会在不修改文件的情况下取消；可改用不生成摘要的导航，或先用 `/checkpoint` 保留后续修改
-  - user、assistant、tool result、custom message、compaction 和 branch summary 节点都会解析到对应操作的精确快照；没有精确语义锚点时会取消恢复
+**在我的目录里没有生效。**
+运行 `/history-status`，它会说明原因。默认情况下，当前目录或上级目录里需要有项目标记，例如 `.git`、`.jj`、`package.json`、`Cargo.toml`、`go.mod`、`pyproject.toml`；在用户 home 目录，以及只是放了好几个仓库的文件夹里，插件不会启用。设置 `"workspaceHistory": { "enabled": true }` 可以强制启用。
 
-- Dirty guard
-  - 如果当前工作区有未快照的手动修改，会阻止危险的工作区恢复
-  - 只回退对话时会保留并快照这些修改，不会覆盖
-
-- Session isolation
-  - 每个 session 使用独立的 shadow git 和 redo 状态
-  - 避免新会话 `/undo` 时串到旧会话历史
-
-## 工作方式
-
-插件内部使用独立的 shadow git 来保存快照，而不是依赖用户项目本身的 `.git` 历史。
-
-内部快照提交不使用 Git 签名，因此保存历史无需解锁签名密钥。用户的全局和项目 Git 签名设置保持不变。
-
-同一套文件历史流程可用于 Git 仓库、Jujutsu 仓库以及 Git/Jujutsu colocated 仓库。仓库元数据（`.git/` 和 `.jj/`）不会进入快照，也不会被恢复。因此，工作区撤销只恢复文件内容，不会回退 Git 的 commit、branch 或 index，也不会回退 Jujutsu 的 commit、bookmark 或 operation。撤销后，`git status` 或 `jj status` 可能会把恢复的文件显示为工作区修改；如需回退仓库历史，请使用对应 VCS 自身的恢复命令。
-
-嵌套 Git 仓库（包括没有提交的空仓库和使用 `.git` 文件的 worktree）不会纳入外层工作区的快照和 undo/redo。插件会在每个扩展运行周期内对每个排除仓库提示一次路径；需要管理其历史时，请直接进入子仓库运行 Pi。候选路径由 Git 按忽略规则列出，包括子目录 `.gitignore`；仓库检测不会把恢复扫描的数量上限施加到普通快照上。
-
-Git 命令超过 `workspaceHistory.gitTimeoutMs` 后，插件仍会跟踪它直到结束；同一个 Pi 进程中，该工作区后续 Git 操作暂时被阻止，扩展重载也不会丢失跟踪，避免前一个进程仍占用 `index.lock` 时启动第二个写入者。大工作区可提高超时，待 Git 结束后重试。插件不再只凭锁文件时间戳删除锁；来源不明的遗留锁会保留，并在错误中给出路径。只有确认没有 Git 进程使用该 Shadow Repo 后，才能手动移除锁。
-
-会改动工作区文件的恢复命令超时后，插件会等待命令实际结束再启动回滚。这可能超过配置的超时时间，但能避免后台恢复与回滚同时写同一批文件。
-
-即使工作区只使用 Jujutsu，扩展仍需要 Git 可执行文件来维护私有 shadow 仓库。
-
-一个撤销单元从原始 prompt 开始，直到 Pi 报告 Agent 已 settled 为止。中间工具轮次各自拥有 `/tree` 锚点，但排队输入不会替换该操作最初的 prompt 或 `before` 快照。因此，一次 `/undo` 会完整撤销多轮工具调用的全部结果，`/redo` 也会把它作为整体恢复。
-
-从会话的第二条 prompt 起，发送不再等待 `before` 快照：快照在模型思考时进行，Agent 的第一次工具调用会等它完成，因此撤销仍能恢复到操作开始前的文件。第一条 prompt 仍会等待，因为 baseline 快照必须记录在它之前。如果 `before` 快照失败，错误会在该轮结束时报告，这次操作不会进入撤销历史。
-
-在 WSL2 中，Git 访问 Windows 盘（`/mnt/c`、`/mnt/d` 等）比访问 Linux 文件系统慢得多，快照也会随之变慢。建议把项目放在 Linux 文件系统中（例如 `~` 下）。
-
-只回退对话且不生成分支摘要时，插件会先处理此前中断恢复留下的待恢复工作；如果中断恢复后文件又被修改，这些后续修改会自动保留。随后插件快照当前文件，并将其作为后续历史分支的起点。继续对话后，分支中正常可见的消息节点即可通过 `/tree` 恢复这份保留的工作区状态。取消选择时，对话和工作区都不改变；非交互模式继续沿用原来的“对话和工作区一起恢复”行为。
-
-默认快照范围：
-
-- 已由内部 shadow 仓库纳管的文件
-- 未被 ignore 的新文件
-- 命中工作区 `.gitignore` 的路径会被过滤掉，即使它们此前已经进入过快照范围
-
-默认排除：
-
-- `.git/`
-- `.jj/`
-- `.pi/workspace-history/`
-- `node_modules/`
-- `dist/`
-- `build/`
-- `.cache/`
-- `.next/`
-- `.turbo/`
-- `coverage/`
-- `.env`
-- `.env.*`
-
-这些路径属于硬排除。即使工作区 `.gitignore` 写了 `!.env.local` 或 `!node_modules/example.js`，也不能把它们重新纳入快照。升级后，新快照还会移除旧版本曾纳管的排除路径；恢复旧快照时也不会覆盖当前的排除文件。
-
-恢复时，插件只恢复它纳管的文件集合，不会粗暴地对整个工作区做无差别清理。
-
-在 Windows 上，恢复操作会重试短暂锁定的纳管文件。如果文件持续被占用，导航会取消而不会跳过该文件，并在提示中指出失败的 Git 文件操作。待恢复状态可跨会话或扩展重载保留；恢复失败后产生的新编辑不会被自动覆盖，可先用 `/checkpoint` 保留。
-
-插件会在使用前校验当前 session 的 shadow repo。如果已校验的仓库在 session 运行期间消失，插件会检测并自动重建。如果当前 session repo 或工作区 reusable repo 无效，插件会先将其原样保留为同级的 `repo.git.invalid-<timestamp>-<uuid>`，再自动重建可用仓库。后续快照可继续正常工作，但仅存在于丢失或无效仓库中的旧快照可能不可用。其他 session 的无效仓库只会被跳过，不会被修改。
+**底栏显示 `snapshot failed`。**
+有一次快照没能保存，之后的操作可能无法撤销。`/history-status` 会显示具体错误。等下一次操作被成功记录，这个提示就会消失。
 
 ## 配置
 
-通过 Pi 的 settings 配置：
-
-- 全局：`~/.pi/agent/settings.json`
-- 项目：`.pi/settings.json`
-
-示例：
+设置项放在 `~/.pi/agent/settings.json`（全局）或 `.pi/settings.json`（项目）的 `workspaceHistory` 下。在 Pi 1.x 上，只有信任了项目文件夹，项目设置才会生效，和 Pi 自己读取项目设置的规则一致。
 
 ```json
 {
@@ -176,102 +83,56 @@ Git 命令超过 `workspaceHistory.gitTimeoutMs` 后，插件仍会跟踪它直�
 }
 ```
 
-配置项：
+| 设置项 | 默认值 | 说明 |
+|---|---|---|
+| `enabled` | `"auto"` | `"auto"` 在项目里启用（见上面的常见问题）；`true` 总是启用；`false` 关闭 |
+| `requireProjectMarker` | `true` | 设为 `false` 时，`"auto"` 接受文件系统根目录和用户 home 目录以外的任意目录，并跳过多仓库文件夹的判断 |
+| `allowHomeDirectory` | `false` | 允许在用户 home 目录启用 |
+| `storageDir` | `~/.pi/agent/state/workspace-history` | 历史的存储位置。必须在工作区之外，否则插件会自动停用 |
+| `maxSessionsPerWorkspace` | `3` | 每个工作区保留的会话数；超出时删除最久未用的非活跃会话 |
+| `maxWorkspaces` | `10` | 总共保留的工作区数；超出时删除最久未用的非活跃工作区 |
+| `maxUntrackedFileSizeMB` | `10` | 超过这个大小的新文件会被跳过；`0` 表示不限制 |
+| `showStatus` | `true` | 在底栏显示 `⟲ history` |
+| `gitTimeoutMs` | `60000` | 每条内部 Git 命令的超时时间；工作区特别大时可以调高 |
+| `maxScanFiles`、`maxScanDirs`、`maxScanMs` | `20000`、`3000`、`5000` | 恢复时查找排除路径的扫描上限；超过上限时改用 Git 列出这些路径 |
 
-- `workspaceHistory.storageDir`
-  - shadow history 的外部存储根目录
-  - 默认：`~/.pi/agent/state/workspace-history`
-  - 必须位于工作区之外。如果它等于工作区或位于工作区内部，即使 `enabled` 为 `true`，插件也会禁用，且不会在其中创建历史目录。
-- `workspaceHistory.maxSessionsPerWorkspace`
-  - 通过清理最久未使用的非活跃 session，使每个工作区的 session 总数尽量保持在上限内
-  - 活跃 session 永远不会被清理，因此总数可能暂时超过此上限
-  - 默认：`3`
-- `workspaceHistory.maxWorkspaces`
-  - 通过清理最久未使用的非活跃工作区，使全局工作区总数尽量保持在上限内
-  - 包含活跃 session 的工作区永远不会被清理，因此总数可能暂时超过此上限
-  - 默认：`10`
-- `workspaceHistory.enabled`
-  - `auto`（默认）在当前目录或祖先目录存在已声明项目标记时启用
-  - 自动模式且要求项目标记时，如果当前目录自身没有 `.git` 或 `.jj`，但至少两个直属非隐藏子目录是仓库，则插件会跳过该多仓库容器目录
-  - 多仓库容器检查是浅层且有界的；无法可靠完成判断时，workspace-history 继续启用
-  - `true` 强制启用，包括多仓库容器目录
-  - `false` 完全禁用
-- `workspaceHistory.allowHomeDirectory`
-  - 是否允许在用户 home 目录启用
-  - 默认：`false`
-- `workspaceHistory.requireProjectMarker`
-  - 是否要求当前目录或祖先目录存在 `.git`、`.jj`、`package.json`、`Cargo.toml`、`go.mod`、`pyproject.toml` 等项目标记
-  - 默认：`true`
-  - 设为 `false` 时，自动模式允许文件系统根目录和用户 home 目录以外的任意目录（home 目录仍需同时启用 `allowHomeDirectory`），并跳过多仓库容器判断
-- `workspaceHistory.maxScanFiles`
-- `workspaceHistory.maxScanDirs`
-- `workspaceHistory.maxScanMs`
-  - 恢复时扫描工作区的安全限制
-- `workspaceHistory.gitTimeoutMs`
-  - 插件内部 git 操作超时时间
+下面这些 Pi 设置是可选的，能让历史导航更快捷：
 
-## 安装与使用
-
-如果作为插件包安装：
-
-```bash
-pi install npm:pi-workspace-history
+```json
+{
+  "doubleEscapeAction": "tree",
+  "treeFilterMode": "user-only"
+}
 ```
 
-当这个包发布到 npm 后，用户就可以直接用上面的命令安装。
+`doubleEscapeAction: "tree"`（Pi 的默认值）让双击 Esc 打开 `/tree`。`treeFilterMode: "user-only"` 让 `/tree` 只列出你的提示词，选撤销点更快。
 
-如果从本地仓库安装：
+## 性能
 
-```bash
-pi install /path/to/workspace-history
-```
+测试条件：2000 个文件的工作区，每条提示词写一个文件：
 
-## 本地开发
+| 环境 | 发送前的等待 | 每条提示词增加的耗时 |
+|---|---|---|
+| Windows 11 原生 | 2–5 ms | 约 0.5–1 秒 |
+| WSL2，项目位于 `/mnt/g` | 约 12 ms | 约 3 秒 |
 
-当前仓库也支持项目内直接加载扩展，便于开发调试：
+会话的第一条提示词需要等待初始快照，不过这个快照通常在你打字时就已在后台完成。在 Windows 11 上，2 万个文件的仓库建立初始快照约需 5 秒。复现方法：`npm run bench:first-turn -- 2000 256`。
 
-```text
-.pi/extensions/workspace-history.ts
-.pi/settings.json
-```
+在 Windows 11 上，`/undo` 和 `/redo` 在 2000 个文件的仓库里约需 0.7 秒，5000 个文件约 1 秒，2 万个文件约 1.5 秒。在 Linux 上（WSL2，项目位于 Linux 文件系统），2000 个文件约 0.1 秒，2 万个文件约 0.6 秒。
 
-在这个目录启动 `pi`，或执行 `/reload` 后即可测试本地修改。
+## 工作原理
 
-也可以把 `workspace-history.ts` 放到：
+每条提示词发出前，插件把工作区快照到这个会话专用的私有 Git 仓库；Agent 结束后再快照一次。每个快照都和对话树里的位置关联，所以 `/undo` 和 `/tree` 能恢复任意位置对应的文件。恢复时只写插件管理的文件，从不清理工作区里的其他内容。
 
-- `~/.pi/agent/extensions/`
-- `.pi/extensions/`
+- **发送不等待。** 从第二条提示词起，快照在模型思考时进行，Agent 的第一次工具调用会等它完成。如果快照失败，这次操作不会进入历史，错误会在这一轮结束时报告，底栏也会显示。
+- **会话互相隔离。** 每个会话有自己的历史和重做状态，新会话不会撤销到旧会话的历史里。
+- **只回退对话时**，会先保存当前文件，新的分支从这份文件继续。
+- **Windows 上被占用的文件**会短暂重试。如果一直被占用，恢复会取消而不会跳过这个文件，待恢复的状态在重载后仍然保留；恢复失败后你做的修改不会被自动覆盖。
+- **Git 超时。** 超过 `gitTimeoutMs` 的 Git 命令会被跟踪到它结束为止，期间这个工作区不会启动别的 Git 命令，避免两个写入者同时使用索引。来源不明的遗留 `index.lock` 会连同路径一起报告，绝不会被删除。
+- **损坏的历史**会在使用前被发现。损坏的仓库会保留为 `repo.git.invalid-<timestamp>-<uuid>`，然后新建一个；只存在于损坏仓库里的快照可能无法使用。
+- **快照提交从不签名**，保存历史不会要求解锁签名密钥。你的 Git 配置保持不变。
 
-## 测试
-
-开发与 CI 使用 `@earendil-works/pi-coding-agent` 0.84.4 和 Node.js 22.19.0，并同时在 Linux 与 Windows 上运行。
-
-运行自动化测试：
-
-```bash
-npm test
-```
-
-运行类型检查：
-
-```bash
-npm run typecheck
-```
-
-## 最近更新
-
-- 文件有改动时，快照只暂存改动的文件，不再重新扫描整个工作区
-- 发送 prompt 不再等待工作区快照，每次快照扫描工作区的次数也更少
-- Git、Jujutsu 和 colocated 仓库共用同一套文件历史流程，同时保持各自的 VCS 元数据不变
-- 完整的多轮 Agent 操作现在作为一个 undo / redo 单元
-- 即使 `.gitignore` 使用反向规则，硬排除路径也不会重新被纳管
-- Git、Rust、Go、Python 等项目标记可从祖先目录识别
-- 无效 shadow repo 会自动隔离并重建
-- 并发运行的活跃 session 不会被保留清理误删
-
-## 存储目录
-
-插件默认把历史存到工作区外：
+存储结构：
 
 ```text
 ~/.pi/agent/state/workspace-history/
@@ -288,12 +149,28 @@ npm run typecheck
     timemachine.log
 ```
 
-说明：
+运行中的会话持有租约，清理永远不会删除它们的历史。元数据读不出来的条目也会保留。
 
-- shadow git 与用户项目自身的 `.git` 历史隔离
-- 自动恢复时，无效的 shadow repo 会保留为 `repo.git.invalid-<timestamp>-<uuid>`
-- 旧的工作区内 `.pi/workspace-history/` 状态不会自动迁移
-- 非活跃 session 按最近使用时间清理（LRU 风格）
-- 进程租约会保护活跃 session 及其工作区。租约对应进程已不存在时通常按非活跃处理；PID 被复用的极少数情况下只会保守地多保留旧历史，不会导致活跃历史被删除
-- 保留清理只删除元数据有效的非活跃目录；元数据损坏的目录会保留，便于人工恢复
-- 在 `auto` 模式下，插件会在像用户 home 目录这样的宽泛目录里自动禁用，避免启动扫描过大导致卡顿
+## 给 AI Agent 的安装说明
+
+替用户安装时：
+
+1. 检查前置条件：`node --version`（22.19.0 或更高）、`pi --version`（0.84.4 或更高）、`git --version`。
+2. 运行 `pi install npm:pi-workspace-history`（只装到当前项目则用 `pi install -l npm:pi-workspace-history`）。
+3. 重启 Pi 或运行 `/reload`。验证：底栏显示 `⟲ history`，且 `/history-status` 显示 `Workspace history: active`。如果显示 inactive，会同时给出原因；在没有项目标记的目录里，可在 `.pi/settings.json` 中设置 `"workspaceHistory": { "enabled": true }`。
+
+纯文本摘要见 [`llms.txt`](./llms.txt)。
+
+## 开发
+
+```bash
+npm ci
+npm test
+npm run typecheck
+```
+
+本仓库通过 `.pi/settings.json` 从 `.pi/extensions/workspace-history.ts` 加载扩展：在这里启动 `pi`，改动后运行 `/reload` 即可。要在别处安装本地代码，运行 `pi install /path/to/pi-workspace-history`。
+
+开发使用 Pi 1.0.4 和 Node.js 22.19.0。CI 在 Linux 与 Windows 上，分别针对 Pi 1.0.4 和最低支持版本 0.84.4 运行。
+
+版本变更见 [CHANGELOG.md](./CHANGELOG.md)。

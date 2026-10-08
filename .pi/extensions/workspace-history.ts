@@ -6,9 +6,12 @@ import type {
   SessionEntry,
   SessionMessageEntry,
 } from "@earendil-works/pi-coding-agent";
+import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import {
   access,
   appendFile,
+  chmod,
+  lstat,
   mkdir,
   opendir,
   readFile,
@@ -44,6 +47,10 @@ const MULTI_REPO_SCAN_MAX_MS = 250;
 const MULTI_REPO_SCAN_BATCH_SIZE = 16;
 const MULTI_REPO_SCAN_CACHE_MS = 30_000;
 const MAX_CHANGED_PATHS_TO_STAGE = 1_000;
+const DEFAULT_MAX_UNTRACKED_FILE_SIZE_MB = 10;
+const STATUS_KEY = "workspace-history";
+const USER_COMMAND_ACTIONS = new Set(["undo", "redo", "checkpoint", "diff"]);
+const DIFF_MAX_PATCH_LINES = 5_000;
 const PROJECT_MARKER_FILES = [
   ".git",
   ".jj",
@@ -169,6 +176,11 @@ interface RuntimeState {
   // Paths from the latest `git status` against HEAD; only these can differ
   // between the shadow index and the workspace while HEAD is unchanged.
   lastStatusChanges?: { head: string; paths: string[] };
+  // New files above maxUntrackedFileSizeMB; treated like ignored paths.
+  oversizedPaths?: Set<string>;
+  lastSnapshotFailure?: { at: string; message: string };
+  // True from a failed snapshot until the next operation is captured.
+  snapshotFailing?: boolean;
   initialSnapshotCommit?: string;
   warmedBaselineCommit?: string;
   pendingBeforeSnapshotPrompt?: string;
@@ -213,12 +225,16 @@ interface WorkspaceHistorySettings {
   maxScanDirs: number;
   maxScanMs: number;
   gitTimeoutMs: number;
+  showStatus: boolean;
+  maxUntrackedFileSizeMB: number;
 }
 
 interface WorkspaceHistoryAvailability {
   enabled: boolean;
   reason?: string;
   unsafeStorageDir?: boolean;
+  // Skipped for an expected reason (not a project, or turned off), so no warning unless a command is used.
+  quiet?: boolean;
 }
 
 interface WorkspaceStoragePaths {
@@ -597,7 +613,13 @@ async function readSettingsFile(settingsPath: string): Promise<Record<string, un
 async function loadWorkspaceHistorySettings(ctx: ExtensionContext): Promise<WorkspaceHistorySettings> {
   const globalSettingsPath = path.join(getAgentDir(), "settings.json");
   const projectSettingsPath = path.join(ctx.cwd, ".pi", "settings.json");
-  const merged = deepMerge(await readSettingsFile(globalSettingsPath), await readSettingsFile(projectSettingsPath));
+  // Pi 1.x skips project settings for folders the user did not trust; so do
+  // we. Pi 0.x has no project trust and always reads them.
+  const isProjectTrusted = (ctx as { isProjectTrusted?: () => boolean }).isProjectTrusted?.() ?? true;
+  const merged = deepMerge(
+    await readSettingsFile(globalSettingsPath),
+    isProjectTrusted ? await readSettingsFile(projectSettingsPath) : {},
+  );
   const raw = merged.workspaceHistory;
   const config = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
 
@@ -618,6 +640,10 @@ async function loadWorkspaceHistorySettings(ctx: ExtensionContext): Promise<Work
     maxScanDirs: normalizePositiveInteger(config.maxScanDirs, DEFAULT_MAX_SCAN_DIRS),
     maxScanMs: normalizeTimeoutMs(config.maxScanMs, DEFAULT_MAX_SCAN_MS),
     gitTimeoutMs: normalizeTimeoutMs(config.gitTimeoutMs, DEFAULT_GIT_TIMEOUT_MS),
+    showStatus: config.showStatus !== false,
+    maxUntrackedFileSizeMB: typeof config.maxUntrackedFileSizeMB === "number" && Number.isFinite(config.maxUntrackedFileSizeMB) && config.maxUntrackedFileSizeMB >= 0
+      ? config.maxUntrackedFileSizeMB
+      : DEFAULT_MAX_UNTRACKED_FILE_SIZE_MB,
   };
 }
 
@@ -625,14 +651,8 @@ async function evaluateWorkspaceHistoryAvailability(ctx: ExtensionContext, state
   const settings = await getWorkspaceHistorySettings(ctx, state);
   let availability: WorkspaceHistoryAvailability;
 
-  if (await isStorageDirInsideWorkspace(ctx, settings.storageDir)) {
-    availability = {
-      enabled: false,
-      reason: `workspaceHistory.storageDir must be outside the workspace (${settings.storageDir})`,
-      unsafeStorageDir: true,
-    };
-  } else if (settings.enabled === false) {
-    availability = { enabled: false, reason: "disabled by configuration" };
+  if (settings.enabled === false) {
+    availability = { enabled: false, reason: "disabled by configuration", quiet: true };
   } else if (await isInsideJujutsuMetadata(ctx.cwd)) {
     availability = { enabled: false, reason: "current directory is inside Jujutsu metadata" };
   } else if (settings.enabled === true) {
@@ -644,16 +664,26 @@ async function evaluateWorkspaceHistoryAvailability(ctx: ExtensionContext, state
     const root = path.normalize(path.parse(normalizedCwd).root);
 
     if (!settings.allowHomeDirectory && normalizedCwd === home) {
-      availability = { enabled: false, reason: "current directory is the user home folder" };
+      availability = { enabled: false, reason: "current directory is the user home folder", quiet: true };
     } else if (normalizedCwd === root) {
-      availability = { enabled: false, reason: "current directory is a filesystem root" };
+      availability = { enabled: false, reason: "current directory is a filesystem root", quiet: true };
     } else if (settings.requireProjectMarker && !(await hasProjectMarker(resolvedCwd))) {
-      availability = { enabled: false, reason: "no project marker found" };
+      availability = { enabled: false, reason: "no project marker found", quiet: true };
     } else if (settings.requireProjectMarker && !(await pathExists(path.join(resolvedCwd, ".git"))) && !(await pathExists(path.join(resolvedCwd, ".jj"))) && (await isMultiRepoContainer(ctx, resolvedCwd, state))) {
       availability = { enabled: false, reason: "workspace is a multi-repo container without a root repository" };
     } else {
       availability = { enabled: true };
     }
+  }
+
+  // Only report the storage location when history would otherwise run here, so a directory that is
+  // skipped anyway (such as the home folder, which contains the default storageDir) gets its real reason.
+  if (availability.enabled && await isStorageDirInsideWorkspace(ctx, settings.storageDir)) {
+    availability = {
+      enabled: false,
+      reason: `workspaceHistory.storageDir must be outside the workspace (${settings.storageDir})`,
+      unsafeStorageDir: true,
+    };
   }
 
   return availability;
@@ -1066,7 +1096,7 @@ async function updateReusableShadowRepo(pi: ExtensionAPI, ctx: ExtensionContext,
   }
 
   if (!await exists(paths.reusableGitDir)) {
-    await execGit(pi, ctx, ["clone", "--bare", "--single-branch", "--no-tags", "--no-local", paths.shadowGitDir, paths.reusableGitDir]);
+    await execGit(pi, ctx, ["clone", "--template=", "--bare", "--single-branch", "--no-tags", "--no-local", paths.shadowGitDir, paths.reusableGitDir]);
     await logLine(ctx, `update reusable repo cloned from=${paths.shadowGitDir} to=${paths.reusableGitDir}`, state);
     return;
   }
@@ -1083,7 +1113,7 @@ function scheduleReusableShadowRepoUpdate(pi: ExtensionAPI, ctx: ExtensionContex
   state.reusableRepoUpdatePromise = Promise.resolve().then(async () => {
     await updateReusableShadowRepo(pi, ctx, state);
   }).catch((error) => {
-    void logLine(ctx, `update reusable repo failed error=${String(error)}`, state);
+    void logLine(ctx, `update reusable repo failed error=${String(error)}`, state).catch(() => undefined);
     if (!state.reusableRepoFailureNoticeShown) {
       try {
         ctx.ui.notify(
@@ -1236,16 +1266,18 @@ function getHardExcludeMatcher(state?: RuntimeState): Ignore {
   return matcher;
 }
 
-async function isSnapshotPathExcluded(
+// Reads the ignore rules once, so callers can test many paths without rereading .gitignore.
+async function createSnapshotPathExcluder(
   ctx: ExtensionContext,
-  relativePath: string,
   state?: RuntimeState,
-): Promise<boolean> {
-  const normalizedPath = normalizeSnapshotPath(relativePath);
-  if (isWindowsReservedSnapshotPath(normalizedPath) || getHardExcludeMatcher(state).ignores(normalizedPath)) {
-    return true;
-  }
-  return (await getSnapshotIgnoreMatcher(ctx, state)).ignores(normalizedPath);
+): Promise<(relativePath: string) => boolean> {
+  const matcher = await getSnapshotIgnoreMatcher(ctx, state);
+  const hardMatcher = getHardExcludeMatcher(state);
+  return (relativePath) => {
+    const normalizedPath = normalizeSnapshotPath(relativePath);
+    return isWindowsReservedSnapshotPath(normalizedPath) || hardMatcher.ignores(normalizedPath)
+      || state?.oversizedPaths?.has(normalizedPath) === true || matcher.ignores(normalizedPath);
+  };
 }
 
 async function filterSnapshotPaths(
@@ -1258,7 +1290,8 @@ async function filterSnapshotPaths(
   const included = relativePaths.filter(relativePath => {
     const normalized = normalizeSnapshotPath(relativePath);
     return !isWindowsReservedSnapshotPath(normalized)
-      && !hardMatcher.ignores(normalized) && !matcher.ignores(normalized);
+      && !hardMatcher.ignores(normalized) && !matcher.ignores(normalized)
+      && !state?.oversizedPaths?.has(normalized);
   });
   const repositories = await findNestedRepositoryBoundaries(ctx, included, state);
   return included.filter(relativePath => {
@@ -1347,14 +1380,68 @@ async function findNestedRepositories(
 ): Promise<string[]> {
   // Git handles nested .gitignore files and reports untracked repositories as
   // directory entries. Inspect only these paths and tracked paths' ancestors.
-  const result = await runGitCommand(pi, ctx, await gitArgs(ctx, state, "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "."), state);
+  // `-t` tags untracked entries with "?", which also feeds the large-file check.
+  const result = await runGitCommand(pi, ctx, await gitArgs(ctx, state, "ls-files", "-t", "--cached", "--others", "--exclude-standard", "-z", "--", "."), state);
   if (result.code !== 0) throw new Error(result.stderr || result.stdout || "git ls-files failed");
-  return findNestedRepositoryBoundaries(ctx, parseNullSeparatedPaths(result.stdout), state);
+  const records = parseNullSeparatedPaths(result.stdout);
+  await markOversizedUntrackedPaths(ctx, records.filter(record => record.startsWith("? ")).map(record => record.slice(2)), state);
+  return findNestedRepositoryBoundaries(ctx, records.map(record => record.slice(2)), state);
 }
+
+class ScanBudgetExceededError extends Error {}
 
 async function listExcludedWorkspacePaths(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<string[]> {
   const nestedRepositories = new Set(await findNestedRepositories(pi, ctx, state));
+  try {
+    return await walkExcludedWorkspacePaths(ctx, nestedRepositories, state);
+  } catch (error) {
+    if (!(error instanceof ScanBudgetExceededError)) {
+      throw error;
+    }
+    // Large workspaces: ask Git instead of walking every file in Node.
+    await logLine(ctx, `excluded path walk stopped (${error.message}); listing with git`, state);
+    return listExcludedWorkspacePathsWithGit(pi, ctx, nestedRepositories, state);
+  }
+}
+
+// The same paths as the walk: what Git's ignore rules skip, plus untracked
+// files that only this extension excludes (hard excludes cannot be negated
+// by a .gitignore, and oversized files), plus nested repositories.
+async function listExcludedWorkspacePathsWithGit(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  nestedRepositories: Set<string>,
+  state?: RuntimeState,
+): Promise<string[]> {
+  const ignoredResult = await runGitCommand(
+    pi,
+    ctx,
+    await gitArgs(ctx, state, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory", "--", "."),
+    state,
+  );
+  if (ignoredResult.code !== 0) throw new Error(ignoredResult.stderr || ignoredResult.stdout || "git ls-files failed");
+  const untrackedResult = await runGitCommand(
+    pi,
+    ctx,
+    await gitArgs(ctx, state, "ls-files", "-z", "--others", "--exclude-standard", "--", "."),
+    state,
+  );
+  if (untrackedResult.code !== 0) throw new Error(untrackedResult.stderr || untrackedResult.stdout || "git ls-files failed");
+
+  const ignored = parseNullSeparatedPaths(ignoredResult.stdout).map((entry) => entry.replace(/\/$/, ""));
+  const untracked = parseNullSeparatedPaths(untrackedResult.stdout);
+  const included = new Set(await filterSnapshotPaths(ctx, untracked, state));
+  const excludedUntracked = untracked.filter((entry) => !included.has(entry));
+  return [...new Set([...nestedRepositories, ...ignored, ...excludedUntracked])];
+}
+
+async function walkExcludedWorkspacePaths(
+  ctx: ExtensionContext,
+  nestedRepositories: Set<string>,
+  state?: RuntimeState,
+): Promise<string[]> {
   const budget = await getScanBudget(ctx, state);
+  const isExcluded = await createSnapshotPathExcluder(ctx, state);
   const startedAt = Date.now();
   let scannedFiles = 0;
   let scannedDirs = 0;
@@ -1362,13 +1449,13 @@ async function listExcludedWorkspacePaths(pi: ExtensionAPI, ctx: ExtensionContex
 
   function checkBudget(relativePath: string): void {
     if (Date.now() - startedAt > budget.maxMs) {
-      throw new Error(`workspace scan exceeded ${budget.maxMs}ms while scanning ${relativePath || "."}`);
+      throw new ScanBudgetExceededError(`workspace scan exceeded ${budget.maxMs}ms while scanning ${relativePath || "."}`);
     }
     if (scannedFiles > budget.maxFiles) {
-      throw new Error(`workspace scan exceeded ${budget.maxFiles} files`);
+      throw new ScanBudgetExceededError(`workspace scan exceeded ${budget.maxFiles} files`);
     }
     if (scannedDirs > budget.maxDirs) {
-      throw new Error(`workspace scan exceeded ${budget.maxDirs} directories`);
+      throw new ScanBudgetExceededError(`workspace scan exceeded ${budget.maxDirs} directories`);
     }
   }
 
@@ -1384,7 +1471,7 @@ async function listExcludedWorkspacePaths(pi: ExtensionAPI, ctx: ExtensionContex
         scannedFiles += 1;
       }
       checkBudget(relativePath);
-      if (nestedRepositories.has(normalizeSnapshotPath(relativePath)) || await isSnapshotPathExcluded(ctx, relativePath, state)) {
+      if (nestedRepositories.has(normalizeSnapshotPath(relativePath)) || isExcluded(relativePath)) {
         excludedPaths.push(relativePath);
         continue;
       }
@@ -1457,6 +1544,7 @@ async function syncShadowRepoExclude(ctx: ExtensionContext, state?: RuntimeState
     gitignoreSource.trim().length > 0 ? gitignoreSource.trimEnd() : "",
     ...DEFAULT_EXCLUDES.map(normalizeSnapshotPath),
     ...getWindowsReservedIgnorePatterns(),
+    ...[...(state?.oversizedPaths ?? [])].sort().map(toLiteralIgnorePattern),
   ]
     .filter((part) => part.length > 0)
     .join("\n");
@@ -1470,6 +1558,71 @@ async function syncShadowRepoExclude(ctx: ExtensionContext, state?: RuntimeState
   if (state) {
     state.cachedExcludeSource = excludeSource;
   }
+}
+
+// Matches exactly one workspace-relative path in a gitignore-style file.
+function toLiteralIgnorePattern(relativePath: string): string {
+  return "/" + normalizeSnapshotPath(relativePath).replace(/[\\*?[\]!#]/g, character => `\\${character}`).replace(/ $/, "\\ ");
+}
+
+function formatMegabytes(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+// New files above the size limit are kept out of snapshots like ignored
+// paths, so undo/redo neither stores nor deletes them. Already managed files
+// are never affected.
+async function markOversizedUntrackedPaths(
+  ctx: ExtensionContext,
+  untrackedPaths: string[],
+  state?: RuntimeState,
+): Promise<void> {
+  const limitMB = (await getWorkspaceHistorySettings(ctx, state)).maxUntrackedFileSizeMB;
+  if (limitMB <= 0 || untrackedPaths.length === 0) {
+    return;
+  }
+  const limitBytes = limitMB * 1024 * 1024;
+  const found: Array<{ path: string; size: number }> = [];
+  const candidates = untrackedPaths
+    .map(relativePath => normalizeSnapshotPath(relativePath))
+    .filter(relativePath => !relativePath.endsWith("/") && !state?.oversizedPaths?.has(relativePath));
+  for (let offset = 0; offset < candidates.length; offset += 32) {
+    await Promise.all(candidates.slice(offset, offset + 32).map(async relativePath => {
+      const info = await lstat(path.join(ctx.cwd, relativePath)).catch(() => undefined);
+      if (info?.isFile() && info.size > limitBytes) {
+        found.push({ path: relativePath, size: info.size });
+      }
+    }));
+  }
+  if (found.length === 0) {
+    return;
+  }
+  if (state) {
+    state.oversizedPaths ??= new Set();
+  }
+  for (const item of found.sort((left, right) => left.path.localeCompare(right.path))) {
+    state?.oversizedPaths?.add(item.path);
+    ctx.ui.notify(
+      `Large file "${item.path}" (${formatMegabytes(item.size)}) is not included in workspace snapshots or undo/redo. New files above ${limitMB} MB are skipped; change workspaceHistory.maxUntrackedFileSizeMB to adjust.`,
+      "warning",
+    );
+  }
+  await logLine(ctx, `oversized untracked paths ${found.map(item => `${item.path}=${item.size}`).join(" ")}`, state);
+  await syncShadowRepoExclude(ctx, state);
+}
+
+function parsePorcelainUntrackedPaths(raw: string): string[] {
+  const records = raw.split("\0").filter((record) => record.length > 0);
+  const paths: string[] = [];
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index] as string;
+    if (record.startsWith("?? ")) {
+      paths.push(record.slice(3));
+    } else if (record[0] === "R" || record[0] === "C") {
+      index += 1;
+    }
+  }
+  return paths;
 }
 
 function parsePorcelainStatusPaths(raw: string): string[] {
@@ -1667,15 +1820,20 @@ async function stageSnapshotFiles(pi: ExtensionAPI, ctx: ExtensionContext, state
     await logLine(ctx, `stage snapshot done ${elapsedMs(startedAt)}ms`, state);
     return;
   }
+  // A full add can write tens of thousands of blobs. As loose objects that
+  // costs about 4 ms per file on Windows (20,000 files: ~85 s); a threshold of
+  // one byte streams every blob into a single pack instead (~2 s). The setting
+  // is only for this add: Git treats files above it as binary in diffs.
+  const bulkCheckin = ["-c", "core.bigFileThreshold=1"];
   const nestedRepositories = await findNestedRepositories(pi, ctx, state);
   if (nestedRepositories.length === 0) {
-    await execGit(pi, ctx, await gitArgs(ctx, state, "add", "-A", "--", "."));
+    await execGit(pi, ctx, [...bulkCheckin, ...await gitArgs(ctx, state, "add", "-A", "--", ".")]);
   } else {
     const paths = await getWorkspaceStoragePaths(ctx, state);
     const pathspecFile = path.join(paths.sessionRoot, `nested-${randomUUID()}.txt`);
     try {
       await writeFile(pathspecFile, [".", ...nestedRepositories.map(repo => `:(top,literal,exclude)${repo}`)].join("\0") + "\0");
-      await execGit(pi, ctx, await gitArgs(ctx, state, "add", "-A", "--pathspec-from-file", pathspecFile, "--pathspec-file-nul"));
+      await execGit(pi, ctx, [...bulkCheckin, ...await gitArgs(ctx, state, "add", "-A", "--pathspec-from-file", pathspecFile, "--pathspec-file-nul")]);
     } finally {
       await unlink(pathspecFile).catch(() => undefined);
     }
@@ -1695,6 +1853,7 @@ async function listWorkspaceChanges(pi: ExtensionAPI, ctx: ExtensionContext, sta
     throw new Error(statusResult.stderr || statusResult.stdout || "git status failed");
   }
 
+  await markOversizedUntrackedPaths(ctx, parsePorcelainUntrackedPaths(statusResult.stdout), state);
   const changedPaths = await filterSnapshotPaths(ctx, parsePorcelainStatusPaths(statusResult.stdout), state);
   await logLine(ctx, `workspace changes check done ${elapsedMs(startedAt)}ms changed=${changedPaths.length}`, state);
   return changedPaths;
@@ -1723,6 +1882,7 @@ async function buildShadowGitDir(
     if (reusableGitDir) {
       await execGit(pi, ctx, [
         "clone",
+        "--template=",
         ...(reusableGitDir.shared ? ["--shared"] : ["--no-local"]),
         "--bare",
         "--single-branch",
@@ -1732,7 +1892,9 @@ async function buildShadowGitDir(
       ]);
       await execGit(pi, ctx, gitArgsForShadowGitDir(ctx, buildGitDir, "read-tree", "HEAD"));
     } else {
-      await execGit(pi, ctx, ["init", "--bare", buildGitDir]);
+      // No template: sample hooks add nothing to a private snapshot repository,
+      // lengthen its deepest paths, and a user's init.templateDir must not apply.
+      await execGit(pi, ctx, ["init", "--bare", "--template=", buildGitDir]);
     }
     if (!await isBareShadowGitDir(pi, ctx, buildGitDir, state)) {
       throw new Error(`Git did not create a valid bare repository at ${buildGitDir}.`);
@@ -1920,14 +2082,57 @@ async function createSnapshotCommit(
   });
 }
 
+// The shadow repository runs with core.filemode=false, so snapshots do not
+// record the executable bit and checkout-index rewrites restored files as
+// 0644. On POSIX systems, files that are executable before a restore stay
+// executable after it.
+async function listExecutablePathsToRestore(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  commit: string,
+  state?: RuntimeState,
+): Promise<Map<string, number>> {
+  const executable = new Map<string, number>();
+  if (process.platform === "win32") {
+    return executable;
+  }
+  const result = await runGitCommand(pi, ctx, await gitArgs(ctx, state, "diff", "--no-renames", "--name-only", "-z", commit, "--"), state);
+  if (result.code !== 0) throw new Error(result.stderr || result.stdout || "git diff failed");
+  const paths = parseNullSeparatedPaths(result.stdout);
+  for (let offset = 0; offset < paths.length; offset += 32) {
+    await Promise.all(paths.slice(offset, offset + 32).map(async (relativePath) => {
+      const info = await lstat(path.join(ctx.cwd, relativePath)).catch(() => undefined);
+      if (info?.isFile() && (info.mode & 0o111) !== 0) {
+        executable.set(relativePath, info.mode & 0o7777);
+      }
+    }));
+  }
+  return executable;
+}
+
+async function reapplyExecutableBits(ctx: ExtensionContext, executable: Map<string, number>, state?: RuntimeState): Promise<void> {
+  for (const [relativePath, mode] of executable) {
+    const target = path.join(ctx.cwd, relativePath);
+    const info = await lstat(target).catch(() => undefined);
+    if (info?.isFile() && (info.mode & 0o7777) !== mode) {
+      await chmod(target, mode).catch(async (error) => {
+        await logLine(ctx, `restore chmod failed path=${relativePath} error=${String(error)}`, state).catch(() => undefined);
+      });
+    }
+  }
+}
+
 async function restoreSnapshotCommit(pi: ExtensionAPI, ctx: ExtensionContext, commit: string, state?: RuntimeState): Promise<string> {
   await assertWorkspaceHistoryEnabled(ctx, state, "restoreSnapshotCommit");
   await ensureShadowRepo(pi, ctx, state);
   const protectedPaths = await listExcludedWorkspacePaths(pi, ctx, state);
 
+  const executablePaths = await listExecutablePathsToRestore(pi, ctx, commit, state);
+
   await execGit(pi, ctx, await gitArgs(ctx, state, "reset", "--mixed", "--no-refresh", commit));
   await pruneShadowIndexForIgnoreChanges(pi, ctx, state);
   await execGit(pi, ctx, await gitArgs(ctx, state, "checkout-index", "-a", "-f"));
+  await reapplyExecutableBits(ctx, executablePaths, state);
   await execGit(
     pi,
     ctx,
@@ -2502,8 +2707,10 @@ function findLastAfterSnapshot(ctx: ExtensionContext, state?: RuntimeState): Wor
     currentId = entry.parentId ?? null;
   }
 
-  const turns = getTurnSnapshots(state);
-  const turn = turns[turns.length - 1];
+  // An operation that was undone or left by /tree is no longer on this
+  // branch; offering it again would undo the same operation twice.
+  const branchIds = new Set(ctx.sessionManager.getBranch().map((entry) => entry.id));
+  const turn = getTurnSnapshots(state).filter((entry) => branchIds.has(entry.userEntryId)).at(-1);
   return turn ? {
     v: 1,
     kind: "after",
@@ -2607,6 +2814,11 @@ function findAfterSnapshotForMessageAnchor(
   state?: RuntimeState,
 ): WorkspaceSnapshot | undefined {
   if (!entry || entry.type !== "message") {
+    return undefined;
+  }
+  // Earlier versions anchored Pi 1.x's pre-prompt system entry to the
+  // operation that followed it.
+  if ((entry as SessionMessageEntry & { message: { role: string } }).message.role === "system") {
     return undefined;
   }
 
@@ -2719,6 +2931,12 @@ function resolveSnapshotForTreeTarget(
     return target;
   }
 
+  // A system entry carries no workspace state of its own; see
+  // findAfterSnapshotForMessageAnchor for why its anchors are ignored.
+  if (target.type === "message" && (target.message as { role: string }).role === "system") {
+    return findInheritedSnapshotForMetadataTarget(ctx, target.parentId, state);
+  }
+
   const anchoredSnapshot = findNavigationSnapshotForEntry(target.id, state);
   if (anchoredSnapshot) {
     return anchoredSnapshot;
@@ -2798,6 +3016,7 @@ async function isWorkspaceDirtyAgainstCommit(
     throw new Error(untrackedResult.stderr || untrackedResult.stdout || "git ls-files failed");
   }
 
+  await markOversizedUntrackedPaths(ctx, parseNullSeparatedPaths(untrackedResult.stdout), state);
   const changed = (await filterSnapshotPaths(ctx, [
     ...parseNullSeparatedPaths(diffResult.stdout),
     ...parseNullSeparatedPaths(untrackedResult.stdout),
@@ -2968,7 +3187,10 @@ async function ensureWorkspaceHistoryAvailable(
     return true;
   }
 
-  if (state.disabledNoticeReason !== availability.reason) {
+  // Directories that are clearly not projects are skipped quietly; the footer and /history-status show it.
+  // Explain when the user runs one of our commands, and once for a skip the user would not expect.
+  const requestedByUser = USER_COMMAND_ACTIONS.has(action);
+  if (requestedByUser || (!availability.quiet && state.disabledNoticeReason !== availability.reason)) {
     const message = availability.unsafeStorageDir
       ? `Workspace history is disabled: ${availability.reason}. Move storageDir to a directory outside the workspace, then reload Pi.`
       : `Workspace history is disabled for this directory: ${availability.reason ?? "unknown reason"}. Open pi inside a project directory or set workspaceHistory.enabled to true.`;
@@ -2988,6 +3210,115 @@ async function assertWorkspaceHistoryEnabled(
   if (!availability.enabled) {
     throw new Error(`${action} is unavailable: ${availability.reason ?? "disabled"}`);
   }
+}
+
+interface OperationFileChange {
+  path: string;
+  status: string;
+  added?: number;
+  removed?: number;
+}
+
+interface OperationChanges {
+  files: OperationFileChange[];
+  patch: string[];
+  truncated: boolean;
+}
+
+async function listOperationChanges(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  fromCommit: string,
+  toCommit: string,
+  state?: RuntimeState,
+): Promise<OperationChanges> {
+  const diffOptions = ["--no-renames", "--no-ext-diff", "--no-textconv", fromCommit, toCommit, "--", "."];
+  const run = async (...args: string[]) => {
+    const result = await runGitCommand(pi, ctx, await gitArgs(ctx, state, "diff", ...args), state);
+    if (result.code !== 0) throw new Error(result.stderr || result.stdout || "git diff failed");
+    return result.stdout;
+  };
+  const statusRecords = parseNullSeparatedPaths(await run("--name-status", "-z", ...diffOptions));
+  const files: OperationFileChange[] = [];
+  const byPath = new Map<string, OperationFileChange>();
+  for (let index = 0; index + 1 < statusRecords.length; index += 2) {
+    const file = { status: (statusRecords[index] as string).slice(0, 1), path: statusRecords[index + 1] as string };
+    files.push(file);
+    byPath.set(file.path, file);
+  }
+  for (const record of parseNullSeparatedPaths(await run("--numstat", "-z", ...diffOptions))) {
+    const [added, removed, filePath] = record.split("\t");
+    const file = filePath === undefined ? undefined : byPath.get(filePath);
+    if (file && added !== "-") {
+      file.added = Number(added);
+      file.removed = Number(removed);
+    }
+  }
+  const patch = files.length === 0 ? [] : (await run("--no-color", ...diffOptions)).split(/\r?\n/);
+  const truncated = patch.length > DIFF_MAX_PATCH_LINES;
+  return { files, patch: truncated ? patch.slice(0, DIFF_MAX_PATCH_LINES) : patch, truncated };
+}
+
+function formatOperationChangeSummary(changes: OperationChanges): string {
+  const added = changes.files.reduce((sum, file) => sum + (file.added ?? 0), 0);
+  const removed = changes.files.reduce((sum, file) => sum + (file.removed ?? 0), 0);
+  return `${changes.files.length} file${changes.files.length === 1 ? "" : "s"} changed, +${added} -${removed}`;
+}
+
+function formatOperationFileLine(file: OperationFileChange): string {
+  const counts = file.added === undefined ? "binary" : `+${file.added} -${file.removed ?? 0}`;
+  return `${file.status} ${file.path}  ${counts}`;
+}
+
+async function showOperationChanges(ctx: ExtensionCommandContext, title: string, changes: OperationChanges): Promise<void> {
+  const header = [title, formatOperationChangeSummary(changes), ...changes.files.map(formatOperationFileLine)];
+  if (ctx.mode !== "tui") {
+    ctx.ui.notify(header.join("\n"), "info");
+    return;
+  }
+  await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+    const body = [
+      ...header.slice(2).map(line => theme.fg("muted", line)),
+      "",
+      ...changes.patch.map(line => {
+        if (line.startsWith("diff --git")) return theme.bold(line);
+        if (line.startsWith("+++") || line.startsWith("---")) return theme.fg("muted", line);
+        if (line.startsWith("+")) return theme.fg("success", line);
+        if (line.startsWith("-")) return theme.fg("error", line);
+        if (line.startsWith("@@")) return theme.fg("accent", line);
+        return line;
+      }),
+      ...(changes.truncated ? [theme.fg("warning", `… diff truncated after ${DIFF_MAX_PATCH_LINES} lines`)] : []),
+    ];
+    let offset = 0;
+    const pageSize = () => Math.max(5, tui.terminal.rows - 8);
+    const scrollTo = (next: number) => {
+      offset = Math.max(0, Math.min(next, Math.max(0, body.length - pageSize())));
+      tui.requestRender();
+    };
+    return {
+      render(width: number): string[] {
+        const lines = [
+          theme.fg("accent", "─".repeat(width)),
+          truncateToWidth(` ${theme.bold(header[0] ?? "")}  ${theme.fg("muted", header[1] ?? "")}`, width),
+          ...body.slice(offset, offset + pageSize()).map(line => truncateToWidth(` ${line}`, width)),
+          theme.fg("dim", truncateToWidth(` ↑↓ scroll • Space/b page • Esc close  (${Math.min(body.length, offset + pageSize())}/${body.length})`, width)),
+          theme.fg("accent", "─".repeat(width)),
+        ];
+        return lines;
+      },
+      handleInput(data: string): void {
+        if (matchesKey(data, Key.escape) || matchesKey(data, Key.enter) || data === "q") done();
+        else if (matchesKey(data, Key.up) || data === "k") scrollTo(offset - 1);
+        else if (matchesKey(data, Key.down) || data === "j") scrollTo(offset + 1);
+        else if (matchesKey(data, Key.pageUp) || data === "b") scrollTo(offset - pageSize());
+        else if (matchesKey(data, Key.pageDown) || data === " ") scrollTo(offset + pageSize());
+        else if (matchesKey(data, Key.home) || data === "g") scrollTo(0);
+        else if (matchesKey(data, Key.end) || data === "G") scrollTo(body.length);
+      },
+      invalidate(): void {},
+    };
+  });
 }
 
 export default function workspaceHistoryExtension(pi: ExtensionAPI) {
@@ -3028,7 +3359,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       state.baselineWarmupPromise = (async () => {
         const startedAt = Date.now();
         state.baselineWarmupInProgress = true;
-        await logLine(ctx, `warm baseline start generation=${generation}`, state);
+        await logLine(ctx, `warm baseline start generation=${generation}`, state).catch(() => undefined);
         try {
           if (
             state.baselineWarmupGeneration !== generation ||
@@ -3185,6 +3516,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     const gate: BeforeSnapshotGate = { promise: Promise.resolve() };
     gate.promise = ensureBeforeSnapshotForTurn(ctx, state, promptText).catch(async (error: unknown) => {
       gate.error = error;
+      await recordSnapshotFailure(ctx, state, error);
       await logLine(ctx, `before snapshot failed error=${String(error)}`, state).catch(() => undefined);
     });
     state.beforeSnapshotGate = gate;
@@ -3202,6 +3534,19 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       gate.reported = true;
       throw gate.error;
     }
+  }
+
+  // A neutral "active" marker; a count would read like remaining undo steps.
+  async function updateStatusIndicator(ctx: ExtensionContext, state: RuntimeState): Promise<void> {
+    const settings = await getWorkspaceHistorySettings(ctx, state);
+    const text = state.snapshotFailing ? "⟲ history: snapshot failed, see /history-status" : "⟲ history";
+    ctx.ui.setStatus(STATUS_KEY, settings.showStatus ? text : undefined);
+  }
+
+  async function recordSnapshotFailure(ctx: ExtensionContext, state: RuntimeState, error: unknown): Promise<void> {
+    state.lastSnapshotFailure = { at: new Date().toISOString(), message: String(error) };
+    state.snapshotFailing = true;
+    await updateStatusIndicator(ctx, state).catch(() => undefined);
   }
 
   function clearPendingAgentOperation(state: RuntimeState): void {
@@ -3282,7 +3627,10 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       commit = await createSnapshotCommit(pi, ctx, `after ${state.pendingTurnId}`, state, true);
     }
 
-    for (const entry of operationEntries) {
+    // Pi 1.x records a system entry just before the prompt. Entries ahead of
+    // the prompt belong to the state before this operation, not after it.
+    const firstOperationIndex = Math.max(0, operationEntries.findIndex((entry) => entry.id === originalUserEntry.id));
+    for (const entry of operationEntries.slice(firstOperationIndex)) {
       const isOriginalUser = entry.id === originalUserEntry.id;
       const isQueuedUser = isUserMessageEntry(entry) && !isOriginalUser;
       anchorPendingOperationEntry(
@@ -3314,6 +3662,10 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       snapshots.turns.push(record);
     }
     await writeTurnSnapshotState(ctx, snapshots, state);
+    if (state.snapshotFailing) {
+      state.snapshotFailing = false;
+      await updateStatusIndicator(ctx, state);
+    }
     await logLine(
       ctx,
       `capture operation snapshot source=${source} turn=${record.turnId} userEntry=${record.userEntryId} assistantEntry=${record.assistantEntryId} beforeCommit=${record.beforeCommit} afterCommit=${record.afterCommit} anchors=${anchors.length}`,
@@ -3362,10 +3714,11 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.multiRepoContainerCache = undefined;
 
     if (!await ensureWorkspaceHistoryAvailable(ctx, state, "session_start")) {
+      ctx.ui.setStatus(STATUS_KEY, undefined);
       return;
     }
 
-    await getWorkspaceHistorySettings(ctx, state);
+    await updateStatusIndicator(ctx, state);
     await getWorkspaceStoragePaths(ctx, state);
     await acquireSessionLease(ctx, state);
     state.pendingRecovery = await readPendingRecoveryState(ctx, state);
@@ -3382,6 +3735,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (_event, ctx) => {
     const state = getState(ctx);
+    cancelBaselineWarmup(state);
     await waitForBeforeSnapshot(state);
     await state.reusableRepoUpdatePromise?.catch(() => undefined);
     await releaseSessionLease(ctx, state);
@@ -3401,7 +3755,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     }
     state.pendingPromptText = event.text;
     void ensureBeforeSnapshotForTurn(ctx, state, event.text).catch((error) => {
-      void logLine(ctx, `input before snapshot failed error=${String(error)}`, state);
+      void logLine(ctx, `input before snapshot failed error=${String(error)}`, state).catch(() => undefined);
     });
     await logLine(ctx, "input before snapshot scheduled", state);
     return { action: "continue" };
@@ -3467,6 +3821,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       }
       await capturePendingAgentOperation(ctx, state, "turn_end");
     } catch (error) {
+      await recordSnapshotFailure(ctx, state, error);
       await logLine(ctx, `after snapshot failed error=${String(error)}`, state);
       throw error;
     }
@@ -3903,6 +4258,79 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       await clearRedoStack(ctx, state);
       await logLine(ctx, `create manual snapshot entry=${ctx.sessionManager.getLeafId()} label=${label} commit=${commit}`, state);
       ctx.ui.notify(`Checkpoint saved: ${label}`, "info");
+    },
+  });
+
+  pi.registerCommand("diff", {
+    description: "Show the file changes made by the latest agent operation (/diff 2 for the one before)",
+    handler: async (args, ctx: ExtensionCommandContext) => {
+      await ctx.waitForIdle();
+      const state = getState(ctx);
+      if (!await ensureWorkspaceHistoryAvailable(ctx, state, "diff")) {
+        return;
+      }
+      const requested = args.trim() === "" ? 1 : Number(args.trim());
+      if (!Number.isInteger(requested) || requested < 1) {
+        ctx.ui.notify("Usage: /diff [n] — n counts agent operations back from the latest, starting at 1.", "warning");
+        return;
+      }
+      const branchIds = new Set(ctx.sessionManager.getBranch().map(entry => entry.id));
+      // Operations that only talked have nothing to show, so they are not counted.
+      const turns = (await readTurnSnapshotState(ctx, state)).turns
+        .filter(turn => branchIds.has(turn.userEntryId) && turn.beforeCommit !== turn.afterCommit);
+      const turn = turns[turns.length - requested];
+      if (!turn) {
+        ctx.ui.notify(
+          turns.length === 0
+            ? "No agent operation with file history on this branch yet."
+            : `Only ${turns.length} agent operation${turns.length === 1 ? "" : "s"} changed files on this branch.`,
+          "info",
+        );
+        return;
+      }
+      await ensureShadowRepo(pi, ctx, state);
+      for (const commit of [turn.beforeCommit, turn.afterCommit]) {
+        if (!await isSnapshotCommitAvailable(pi, ctx, commit, state)) {
+          ctx.ui.notify("The snapshots for that operation are no longer available.", "warning");
+          return;
+        }
+      }
+      const changes = await listOperationChanges(pi, ctx, turn.beforeCommit, turn.afterCommit, state);
+      const prompt = (turn.promptText ?? "").replace(/\s+/g, " ").trim();
+      const title = prompt ? `Changes from "${prompt.length > 60 ? `${prompt.slice(0, 57)}...` : prompt}"` : "Changes from agent operation";
+      if (changes.files.length === 0) {
+        ctx.ui.notify(`${title}: no files changed.`, "info");
+        return;
+      }
+      await showOperationChanges(ctx, title, changes);
+    },
+  });
+
+  pi.registerCommand("history-status", {
+    description: "Show whether workspace history is active, where it is stored, and recent problems",
+    handler: async (_args, ctx: ExtensionCommandContext) => {
+      const state = getState(ctx);
+      const availability = await evaluateWorkspaceHistoryAvailability(ctx, state);
+      const settings = await getWorkspaceHistorySettings(ctx, state);
+      const lines = [`Workspace history: ${availability.enabled ? "active" : `inactive (${availability.reason ?? "disabled"})`}`];
+      if (availability.enabled) {
+        const paths = await getWorkspaceStoragePaths(ctx, state);
+        const branchIds = new Set(ctx.sessionManager.getBranch().map(entry => entry.id));
+        const turns = (await readTurnSnapshotState(ctx, state)).turns;
+        lines.push(
+          `Storage: ${paths.sessionRoot}`,
+          `Agent operations with file history: ${turns.filter(turn => branchIds.has(turn.userEntryId)).length} on this branch, ${turns.length} in this session`,
+          `Redo available: ${(await readRedoState(ctx, state))?.stack.length ?? 0}`,
+        );
+        if (state.oversizedPaths?.size) {
+          lines.push(`Skipped large files: ${[...state.oversizedPaths].sort().join(", ")}`);
+        }
+        lines.push(state.lastSnapshotFailure
+          ? `Last snapshot failure: ${state.lastSnapshotFailure.at} ${state.lastSnapshotFailure.message}`
+          : "Last snapshot failure: none");
+      }
+      lines.push(`Settings: storageDir=${settings.storageDir}, maxUntrackedFileSizeMB=${settings.maxUntrackedFileSizeMB}, showStatus=${String(settings.showStatus)}`);
+      ctx.ui.notify(lines.join("\n"), "info");
     },
   });
 }

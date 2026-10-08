@@ -1,0 +1,58 @@
+# pi-workspace-history
+
+> Undo, roll back, and revert code changes made by the Pi coding agent (pi.dev): files and conversation together, in one step. Official npm package: pi-workspace-history. MIT license.
+
+## What it does
+
+- Takes a snapshot of the whole workspace before and after every agent operation (one prompt until the agent settles, including all tool rounds, retries, and compaction).
+- `/undo` restores the files to before the last operation and moves the conversation back, putting the prompt back in the editor. It asks one question: files and conversation together, or conversation only.
+- `/redo` reapplies what `/undo` removed.
+- `/tree` (and double Escape) can restore the files that belong to any point in the conversation.
+- Captures changes made by shell commands and by hand, not only by the edit/write tools.
+- History is stored outside the project, in a private Git repository under `~/.pi/agent/state/workspace-history`. The project's commits, branches, index, stash, and refs are never changed.
+
+## Install
+
+Requirements: Pi 0.84.4 or newer (tested on 0.84.4, 1.0.4, and 1.1.0), Node.js 22.19.0 or newer, `git` on PATH.
+
+    pi install npm:pi-workspace-history       # all projects
+    pi install -l npm:pi-workspace-history    # current project only
+    pi -e npm:pi-workspace-history            # try for one run without installing
+
+Verify: the Pi footer shows `⟲ history`, and `/history-status` reports `Workspace history: active`.
+It activates in directories with a project marker (.git, .jj, package.json, Cargo.toml, go.mod, pyproject.toml, and others) in the directory or an ancestor. Elsewhere, set `"workspaceHistory": { "enabled": true }` in `.pi/settings.json`.
+
+## Commands
+
+- `/undo` - go back to before the last agent operation
+- `/redo` - reapply the last undo
+- `/tree` - Pi's history tree; choose whether files follow
+- `/diff [n]` - show files and lines changed by the latest agent operation that changed files (n = 2 for the one before); read only
+- `/checkpoint [label]` - save the current files as a manual checkpoint
+- `/history-status` - active or not (and why), storage path, counts, skipped large files, last snapshot failure
+
+## Settings (under "workspaceHistory" in ~/.pi/agent/settings.json or .pi/settings.json)
+
+- `enabled`: "auto" (default) | true | false
+- `storageDir`: default `~/.pi/agent/state/workspace-history`; must be outside the workspace
+- `maxSessionsPerWorkspace`: default 3
+- `maxWorkspaces`: default 10
+- `maxUntrackedFileSizeMB`: default 10; new files above it are skipped; 0 disables
+- `showStatus`: default true
+- `requireProjectMarker`, `allowHomeDirectory`, `gitTimeoutMs`, `maxScanFiles`, `maxScanDirs`, `maxScanMs`
+
+## Behavior and limits
+
+- Never snapshotted or restored: `.git/`, `.jj/`, `node_modules/`, `dist/`, `build/`, `.cache/`, `.next/`, `.turbo/`, `coverage/`, `.env`, `.env.*`, paths ignored by the workspace `.gitignore`, nested Git repositories, and new files above the size limit.
+- A workspace restore is refused when current files contain changes that are not in history, so manual edits are not overwritten.
+- Restores file contents only; it does not rewind Git or Jujutsu commits, branches, or remote side effects (deployments, API calls, databases).
+- Works in Git, Jujutsu, and colocated repositories, and in non-Git project directories.
+- Prompts after the first are sent without waiting for the snapshot; the agent's first tool call waits for it.
+- On WSL, projects on `/mnt/c` are much slower than on the Linux filesystem.
+
+## Links
+
+- Source and documentation: https://github.com/wcldyx/pi-workspace-history
+- npm: https://www.npmjs.com/package/pi-workspace-history
+- Pi package gallery: https://pi.dev/packages/pi-workspace-history
+- Chinese documentation: https://github.com/wcldyx/pi-workspace-history/blob/main/README.zh-CN.md

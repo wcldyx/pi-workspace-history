@@ -10,6 +10,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        # The oldest supported pi release and the locked development version.
+        pi: ["0.84.4", "locked"]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -24,6 +26,9 @@ jobs:
         with:
           tool: jj-cli@0.44.0
       - run: npm ci
+      - name: Use pi ${{ matrix.pi }}
+        if: matrix.pi != 'locked'
+        run: npm install --no-save --no-audit --no-fund @earendil-works/pi-coding-agent@${{ matrix.pi }} @earendil-works/pi-ai@${{ matrix.pi }} @earendil-works/pi-tui@${{ matrix.pi }}
       - run: npm run typecheck
       - run: npm test
         env:

@@ -1,8 +1,8 @@
 {
   "name": "pi-workspace-history",
-  "version": "0.4.8",
+  "version": "0.5.0",
   "type": "module",
-  "description": "Real workspace undo/redo for Pi. Bring Claude Code style /rewind and OpenCode /undo safety to @earendil-works/pi-coding-agent.",
+  "description": "Undo, roll back, and revert code changes made by the Pi coding agent: files and conversation together. One-step /undo and /redo, /tree workspace restore, /diff, and manual checkpoints, with history kept outside your repository.",
   "author": "wcldyx",
   "keywords": [
     "pi-package",
@@ -16,11 +16,14 @@
     "redo",
     "rewind",
     "rollback",
+    "revert",
+    "restore",
+    "checkpoint",
     "snapshot",
     "git-snapshot",
+    "file-history",
     "time-machine",
-    "claude-code",
-    "opencode"
+    "jujutsu"
   ],
   "license": "MIT",
   "repository": {
@@ -35,12 +38,15 @@
     ".pi/extensions/workspace-history.ts",
     "README.md",
     "README.zh-CN.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "LICENSE",
+    "llms.txt"
   ],
   "pi": {
     "extensions": [
       ".pi/extensions/workspace-history.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/wcldyx/pi-workspace-history/main/demo.gif"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -51,11 +57,13 @@
     "node": ">=22.19.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.4"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.84.4",
-    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@earendil-works/pi-tui": "1.0.4",
     "@types/node": "^24.0.0",
     "tsx": "^4.20.6",
     "typescript": "^5.9.0"

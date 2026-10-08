@@ -1,4 +1,5 @@
-import { access, copyFile, mkdtemp, mkdir, readFile, readdir, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, lstat, mkdtemp, mkdir, readFile, readdir, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { existsSync, rmSync, symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
@@ -663,18 +664,23 @@ interface TestUIState {
   editorText?: string;
   notifications: string[];
   selections: Array<{ title: string; options: string[] }>;
+  statuses: Map<string, string | undefined>;
+  customRenders: string[][];
 }
 
 function configureTestUI(
   session: Awaited<ReturnType<typeof createSession>>,
   choices: string[],
   selectFirstByDefault = false,
+  mode: "tui" | "print" = "print",
 ): TestUIState {
   const state: TestUIState = {
     notifications: [],
     selections: [],
+    statuses: new Map(),
+    customRenders: [],
   };
-  session.extensionRunner.setUIContext(createTestUIContext(state, choices, selectFirstByDefault));
+  session.extensionRunner.setUIContext(createTestUIContext(state, choices, selectFirstByDefault), mode);
   return state;
 }
 
@@ -697,6 +703,8 @@ function createTestUIContext(
   choices: string[],
   selectFirstByDefault = false,
 ): TestUIContext {
+  state.statuses ??= new Map();
+  state.customRenders ??= [];
   const uiContext = new Proxy({
     async select(title: string, options: string[]): Promise<string | undefined> {
       state.selections.push({ title, options: [...options] });
@@ -707,6 +715,21 @@ function createTestUIContext(
     },
     setEditorText(text: string): void {
       state.editorText = text;
+    },
+    setStatus(key: string, text: string | undefined): void {
+      state.statuses.set(key, text);
+    },
+    // Renders the component once, records its lines, then closes it with "q".
+    async custom(factory: (...args: unknown[]) => unknown): Promise<unknown> {
+      return new Promise((resolve) => {
+        const tui = { terminal: { rows: 40 }, requestRender(): void {} };
+        const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+        void Promise.resolve(factory(tui, theme, {}, resolve)).then((component) => {
+          const typed = component as { render(width: number): string[]; handleInput?(data: string): void };
+          state.customRenders.push(typed.render(160));
+          typed.handleInput?.("q");
+        });
+      });
     },
   }, {
     get(target, property) {
@@ -746,6 +769,42 @@ async function testUndoConversationOnlyKeepsWorkspace(): Promise<void> {
         ],
       }],
     );
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testUndoAfterAllOperationsUndoneIsNoop(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    const ui = configureTestUI(session, ["Conversation and workspace", "Conversation and workspace"]);
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "only.txt", content: "only\n" })]),
+      fauxAssistantMessage("created only.txt"),
+    ]);
+    await session.prompt("create only.txt");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "after snapshot was not created");
+
+    await session.prompt("/undo");
+    assert.equal(await exists(path.join(ctx.cwd, "only.txt")), false, "the first undo restores the workspace");
+    const leafAfterUndo = session.sessionManager.getLeafId();
+    const turn = (await readTurnSnapshots(session, ctx.cwd)).turns[0];
+    const preludeIds = new Set(session.sessionManager.getBranch().filter((entry) => {
+      return entry.type === "message" && (entry.message as { role: string }).role === "system";
+    }).map((entry) => entry.id));
+    assert.ok(
+      !(turn?.navigationSnapshots ?? []).some((anchor) => preludeIds.has(anchor.entryId)),
+      "entries before the prompt must not be anchored to the operation",
+    );
+
+    await session.prompt("/undo");
+    assert.equal(ui.selections.length, 1, "an operation that was already undone must not be offered again");
+    assert.equal(ui.notifications.at(-1), "Nothing to undo.");
+    assert.equal(session.sessionManager.getLeafId(), leafAfterUndo, "a no-op undo must not move the conversation");
 
     session.dispose();
   } finally {
@@ -1170,7 +1229,8 @@ async function testCancelledConversationOnlySummaryDoesNotLeakAnchor(): Promise<
     session.abortBranchSummary();
     await assert.rejects(
       summaryNavigation,
-      /Branch summarization failed: This operation was aborted/,
+      // pi 1.x rejects with the AbortError itself instead of wrapping it.
+      /(Branch summarization failed: )?This operation was aborted/,
       "summary navigation should report the abort",
     );
 
@@ -2706,12 +2766,18 @@ async function testAutomaticCompactionContinuationStaysInOneUndoUnit(): Promise<
     ]);
     await session.prompt("establish an older turn before compaction");
 
-    ctx.provider.setResponses([
-      fauxAssistantMessage("truncated", { stopReason: "length" }),
-      fauxAssistantMessage("Compacted the test operation."),
+    // pi 1.x makes one more summarization request per compaction than 0.84,
+    // so answer summaries separately from the agent turns.
+    const agentReplies = [
+      // An explicit overflow error makes every pi version compact and retry.
+      fauxAssistantMessage("", { stopReason: "error", errorMessage: "prompt is too long" }),
       fauxAssistantMessage([fauxToolCall("write", { path: "compacted.txt", content: "compacted\n" })]),
       fauxAssistantMessage("created compacted file"),
-    ]);
+    ];
+    const reply = (context: unknown) => JSON.stringify(context).includes("summarization assistant")
+      ? fauxAssistantMessage("Compacted the test operation.")
+      : agentReplies.shift() ?? fauxAssistantMessage("done");
+    ctx.provider.setResponses(Array.from({ length: 8 }, () => reply));
 
     await session.prompt(`create compacted.txt\n${"context ".repeat(5_000)}`);
     const compactionEntry = session.sessionManager.getEntries().find((entry) => entry.type === "compaction");
@@ -3110,6 +3176,28 @@ async function testMultiRepoContainerScanIsCached(): Promise<void> {
   });
 }
 
+async function testShutdownCancelsBaselineWarmup(): Promise<void> {
+  await withWorkspaceHistoryLogging(async () => {
+    const ctx = await createContext();
+    try {
+      const session = await createSession(ctx);
+      await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      session.dispose();
+
+      await new Promise((resolve) => setTimeout(resolve, 6_000));
+      const logPath = path.join(getWorkspaceHistoryStateDir(ctx.rootDir), "logs", "timemachine.log");
+      const logText = existsSync(logPath) ? await readText(logPath) : "";
+      assert.ok(logText.includes("session_start done"), "the session should have started workspace history");
+      assert.ok(
+        !logText.includes("warm baseline start"),
+        "a shut-down session must not run its pending baseline warmup",
+      );
+    } finally {
+      await disposeContext(ctx);
+    }
+  });
+}
+
 async function testMultiRepoContainerScanIsBounded(): Promise<void> {
   await withWorkspaceHistoryLogging(async () => {
     const ctx = await createContext();
@@ -3390,6 +3478,7 @@ async function testInvalidReusableShadowRepoIsQuarantinedAndRebuilt(): Promise<v
         return false;
       }
     }, "workspace reusable repo was not created", 10000);
+    await session1.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
     session1.dispose();
 
     const markerFile = "reusable-marker.txt";
@@ -3445,6 +3534,9 @@ async function testFailedShadowRepoRebuildDoesNotLeaveCanonicalRepo(): Promise<v
     const sourceGitDir = getShadowGitDir(session1, ctx1.cwd);
     const reusableGitDir = getReusableGitDir(session1, ctx1.cwd);
     await waitFor(async () => await pathExists(path.join(reusableGitDir, "HEAD")), "reusable repo was not created", 10000);
+    // Shutdown waits for the background reusable repo update, which would
+    // otherwise race with (and repair) the corrupt fixture below.
+    await session1.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
     session1.dispose();
 
     const headResult = await execFileAsync("git", ["--git-dir", sourceGitDir, "rev-parse", "--verify", "HEAD^{commit}"], { cwd: ctx1.cwd });
@@ -3809,6 +3901,378 @@ async function testSnapshotStagesOnlyChangedPaths(): Promise<void> {
   }
 }
 
+// pi 0.84 makes the baseline snapshot the first prompt's parent. pi 1.x puts a
+// system-prompt entry there instead, and undo anchors that node with a new
+// snapshot entry. Either way the first prompt leaves the active branch.
+function assertUndoneToBeforeFirstPrompt(
+  session: Awaited<ReturnType<typeof createSession>>,
+  baselineId: string,
+  message: string,
+): void {
+  const leafId = session.sessionManager.getLeafId();
+  if (leafId === baselineId) {
+    return;
+  }
+  const firstUser = session.sessionManager.getEntries().find((entry) => entry.type === "message" && entry.message.role === "user");
+  assert.ok(firstUser, message);
+  const branchIds = session.sessionManager.getBranch().map((entry) => entry.id);
+  assert.ok(!branchIds.includes(firstUser.id) && firstUser.parentId !== null && branchIds.includes(firstUser.parentId), message);
+  assert.ok(branchIds.includes(baselineId), message);
+}
+
+function newTestUIState(): TestUIState {
+  return { notifications: [], selections: [], statuses: new Map(), customRenders: [] };
+}
+
+async function listShadowHeadFiles(session: Awaited<ReturnType<typeof createSession>>, cwd: string): Promise<string[]> {
+  const { stdout } = await execFileAsync("git", shadowGitArgs(session, cwd, "ls-tree", "-r", "-z", "--name-only", "HEAD"));
+  return stdout.split("\0").filter(Boolean).sort();
+}
+
+async function testLargeUntrackedFilesAreSkipped(): Promise<void> {
+  const ctx = await createContext();
+  // About 1 KB, so the fixtures stay small.
+  await writeWorkspaceHistorySettings(ctx, { storageDir: getWorkspaceHistoryStateDir(ctx.rootDir), maxUntrackedFileSizeMB: 0.001 });
+  const big = "x".repeat(4096) + "\n";
+  await writeFile(path.join(ctx.cwd, "big-initial.bin"), big);
+  await writeFile(path.join(ctx.cwd, "grows.txt"), "small\n");
+  const session = await createSession(ctx);
+  try {
+    const ui = configureTestUI(session, [], true);
+    ctx.provider.setResponses([fauxAssistantMessage("hi")]);
+    await session.prompt("hi");
+    let files = await listShadowHeadFiles(session, ctx.cwd);
+    assert.ok(files.includes("grows.txt"));
+    assert.ok(!files.includes("big-initial.bin"), "a large new file is not snapshotted by the full scan");
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([
+        fauxToolCall("write", { path: "big-agent.txt", content: big }),
+        fauxToolCall("write", { path: "small-agent.txt", content: "small\n" }),
+        fauxToolCall("write", { path: "grows.txt", content: big }),
+      ]),
+      fauxAssistantMessage("done"),
+    ]);
+    await session.prompt("write files");
+    files = await listShadowHeadFiles(session, ctx.cwd);
+    assert.ok(files.includes("small-agent.txt"));
+    assert.ok(!files.includes("big-agent.txt"), "a large new file is not snapshotted by the changed-path scan");
+    const { stdout: grown } = await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "cat-file", "-s", "HEAD:grows.txt"));
+    assert.equal(Number(grown.trim()), big.length, "files already in history keep being snapshotted at any size");
+    const largeNotices = () => ui.notifications.filter(message => message.startsWith("Large file"));
+    assert.equal(largeNotices().length, 2);
+    assert.ok(largeNotices().some(message => message.includes("\"big-initial.bin\"")));
+    assert.ok(largeNotices().some(message => message.includes("\"big-agent.txt\"")));
+
+    await session.prompt("/undo");
+    assert.equal(await exists(path.join(ctx.cwd, "small-agent.txt")), false);
+    assert.equal(await readText(path.join(ctx.cwd, "grows.txt")), "small\n");
+    assert.equal(await readText(path.join(ctx.cwd, "big-agent.txt")), big, "undo leaves skipped large files alone");
+    assert.equal(await readText(path.join(ctx.cwd, "big-initial.bin")), big);
+
+    ctx.provider.setResponses([fauxAssistantMessage("again")]);
+    await session.prompt("again");
+    assert.equal(largeNotices().length, 2, "each large file is reported once");
+    await session.prompt("/history-status");
+    assert.match(ui.notifications.at(-1) ?? "", /Skipped large files: big-agent\.txt, big-initial\.bin/);
+  } finally {
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
+async function testLargeFileLimitCanBeDisabled(): Promise<void> {
+  const ctx = await createContext();
+  await writeWorkspaceHistorySettings(ctx, { storageDir: getWorkspaceHistoryStateDir(ctx.rootDir), maxUntrackedFileSizeMB: 0 });
+  await writeFile(path.join(ctx.cwd, "big.bin"), "x".repeat(2 * 1024 * 1024));
+  const session = await createSession(ctx);
+  try {
+    const ui = configureTestUI(session, [], true);
+    ctx.provider.setResponses([fauxAssistantMessage("hi")]);
+    await session.prompt("hi");
+    assert.ok((await listShadowHeadFiles(session, ctx.cwd)).includes("big.bin"));
+    assert.equal(ui.notifications.filter(message => message.startsWith("Large file")).length, 0);
+  } finally {
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
+async function testFullSnapshotWritesOnePack(): Promise<void> {
+  const ctx = await createContext();
+  const session = await createSession(ctx);
+  try {
+    for (let index = 0; index < 50; index += 1) {
+      await writeFile(path.join(ctx.cwd, `file-${index}.txt`), `line ${index}\nsecond\n`);
+    }
+    const ui = configureTestUI(session, [], true, "tui");
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "file-7.txt", content: "line 7\nchanged\n" })]),
+      fauxAssistantMessage("edited"),
+    ]);
+    await session.prompt("edit file-7");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "after snapshot was not created");
+
+    const { stdout } = await execFileAsync("git", ["--git-dir", getShadowGitDir(session, ctx.cwd), "count-objects", "-v"]);
+    const inPack = Number(/^in-pack: (\d+)$/m.exec(stdout)?.[1] ?? 0);
+    assert.ok(inPack >= 50, `the first full snapshot streams its blobs into a pack (in-pack=${inPack})`);
+
+    await session.prompt("/diff");
+    const rendered = ui.customRenders.at(-1)?.join("\n") ?? "";
+    assert.match(rendered, /M file-7\.txt {2}\+1 -1/, "files from the packed snapshot still diff as text");
+    assert.match(rendered, /^ \+changed$/m);
+  } finally {
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
+async function testDiffShowsAgentOperationChanges(): Promise<void> {
+  const ctx = await createContext();
+  const session = await createSession(ctx);
+  try {
+    const ui = configureTestUI(session, [], true, "tui");
+    await session.prompt("/diff");
+    assert.match(ui.notifications.at(-1) ?? "", /No agent operation with file history/);
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "a.txt", content: "one\ntwo\n" })]),
+      fauxAssistantMessage("A"),
+    ]);
+    await session.prompt("write a");
+    ctx.provider.setResponses([
+      fauxAssistantMessage([
+        fauxToolCall("write", { path: "a.txt", content: "one\nthree\n" }),
+        fauxToolCall("write", { path: "b.txt", content: "b\n" }),
+      ]),
+      fauxAssistantMessage("B"),
+    ]);
+    await session.prompt("change a and add b");
+    ctx.provider.setResponses([fauxAssistantMessage("nothing")]);
+    await session.prompt("just talk");
+
+    await session.prompt("/diff");
+    const latest = ui.customRenders.at(-1)?.join("\n") ?? ui.notifications.at(-1) ?? "";
+    assert.match(latest, /Changes from "change a and add b"/, "operations without file history are skipped");
+    assert.match(latest, /2 files changed, \+2 -1/);
+    assert.match(latest, /M a\.txt {2}\+1 -1/);
+    assert.match(latest, /A b\.txt {2}\+1 -0/);
+    if (ui.customRenders.length > 0) {
+      assert.match(latest, /^ \+three$/m);
+      assert.match(latest, /^ -two$/m);
+    }
+
+    const rendersBefore = ui.customRenders.length;
+    await session.prompt("/diff 2");
+    const previous = ui.customRenders.length > rendersBefore ? ui.customRenders.at(-1)?.join("\n") ?? "" : ui.notifications.at(-1) ?? "";
+    assert.match(previous, /Changes from "write a"/);
+    assert.match(previous, /1 file changed, \+2 -0/);
+
+    await session.prompt("/diff 3");
+    assert.match(ui.notifications.at(-1) ?? "", /Only 2 agent operations changed files/);
+    await session.prompt("/diff x");
+    assert.match(ui.notifications.at(-1) ?? "", /Usage: \/diff/);
+    assert.equal(ui.selections.length, 0, "/diff never asks a question");
+  } finally {
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
+async function testStatusIndicatorFollowsSettings(): Promise<void> {
+  const ctx = await createContext();
+  const ui = newTestUIState();
+  const session = await createSession(ctx, undefined, createTestUIContext(ui, [], true));
+  try {
+    assert.equal(ui.statuses.get("workspace-history"), "⟲ history");
+    await session.prompt("/history-status");
+    const status = ui.notifications.at(-1) ?? "";
+    assert.match(status, /^Workspace history: active$/m);
+    assert.match(status, /^Last snapshot failure: none$/m);
+  } finally {
+    session.dispose();
+  }
+
+  await writeWorkspaceHistorySettings(ctx, { storageDir: getWorkspaceHistoryStateDir(ctx.rootDir), showStatus: false });
+  const hidden = newTestUIState();
+  const hiddenSession = await createSession(ctx, undefined, createTestUIContext(hidden, [], true));
+  try {
+    assert.equal(hidden.statuses.get("workspace-history"), undefined);
+  } finally {
+    hiddenSession.dispose();
+  }
+
+  await writeWorkspaceHistorySettings(ctx, { storageDir: getWorkspaceHistoryStateDir(ctx.rootDir), enabled: false });
+  const disabled = newTestUIState();
+  const disabledSession = await createSession(ctx, undefined, createTestUIContext(disabled, [], true));
+  try {
+    assert.ok(disabled.statuses.has("workspace-history"));
+    assert.equal(disabled.statuses.get("workspace-history"), undefined);
+    await disabledSession.prompt("/history-status");
+    assert.match(disabled.notifications.at(-1) ?? "", /^Workspace history: inactive \(disabled by configuration\)$/m);
+  } finally {
+    disabledSession.dispose();
+    await disposeContext(ctx);
+  }
+}
+
+async function testHomeFolderReportsHomeInsteadOfStorageDir(): Promise<void> {
+  const ctx = await createContext();
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  const home = await realpath(ctx.cwd);
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    // Like the default ~/.pi/agent/state/workspace-history when Pi starts in the home folder.
+    await writeWorkspaceHistorySettings(ctx, { storageDir: path.join(home, ".pi", "agent", "state", "workspace-history") });
+    const ui = newTestUIState();
+    const session = await createSession(ctx, undefined, createTestUIContext(ui, [], true));
+    try {
+      ctx.provider.setResponses([fauxAssistantMessage("hello")]);
+      await session.prompt("say hello");
+      assert.deepEqual(ui.notifications, [], "a directory that is not a project is skipped without a warning");
+      await session.prompt("/history-status");
+      assert.match(ui.notifications.at(-1) ?? "", /^Workspace history: inactive \(current directory is the user home folder\)$/m);
+      await session.prompt("/undo");
+      assert.match(ui.notifications.at(-1) ?? "", /^Workspace history is disabled for this directory: current directory is the user home folder\./);
+      assert.ok(
+        ui.notifications.every(message => !message.includes("must be outside the workspace")),
+        "the home folder must not be reported as a storageDir problem",
+      );
+    } finally {
+      session.dispose();
+    }
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previousUserProfile;
+    await disposeContext(ctx);
+  }
+}
+
+async function testUntrustedProjectSettingsAreIgnored(): Promise<void> {
+  const ctx = await createNonProjectContext();
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = path.join(ctx.rootDir, "agent");
+  try {
+    await writeWorkspaceHistorySettings(ctx, { storageDir: getWorkspaceHistoryStateDir(ctx.rootDir), enabled: true });
+
+    ctx.settingsManager.setProjectTrusted(false);
+    const untrusted = newTestUIState();
+    const untrustedSession = await createSession(ctx, undefined, createTestUIContext(untrusted, [], true));
+    try {
+      await untrustedSession.prompt("/history-status");
+      assert.match(
+        untrusted.notifications.at(-1) ?? "",
+        /^Workspace history: inactive \(no project marker found\)$/m,
+        "settings from an untrusted project must not enable workspace history",
+      );
+      assert.equal(await pathExists(path.join(ctx.rootDir, "agent", "state")), false, "nothing is written for an inactive workspace");
+    } finally {
+      untrustedSession.dispose();
+    }
+
+    ctx.settingsManager.setProjectTrusted(true);
+    const trusted = newTestUIState();
+    const trustedSession = await createSession(ctx, undefined, createTestUIContext(trusted, [], true));
+    try {
+      await trustedSession.prompt("/history-status");
+      assert.match(trusted.notifications.at(-1) ?? "", /^Workspace history: active$/m, "a trusted project's settings apply");
+    } finally {
+      trustedSession.dispose();
+    }
+  } finally {
+    if (previousAgentDir === undefined) {
+      delete process.env.PI_CODING_AGENT_DIR;
+    } else {
+      process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    }
+    await disposeContext(ctx);
+  }
+}
+
+async function testUndoDoesNotWriteThroughSymlinks(): Promise<void> {
+  const ctx = await createContext();
+  const session = await createSession(ctx);
+  const outside = path.join(ctx.rootDir, "outside");
+  try {
+    await mkdir(outside);
+    await writeFile(path.join(outside, "a.txt"), "outside\n");
+    await mkdir(path.join(ctx.cwd, "d"));
+    await writeFile(path.join(ctx.cwd, "d", "a.txt"), "inside\n");
+    configureTestUI(session, [], true);
+    ctx.provider.setResponses([fauxAssistantMessage("hi")]);
+    await session.prompt("hi");
+
+    // The operation replaces the directory with a link to a directory outside the workspace.
+    const unsubscribe = session.subscribe((event) => {
+      if (event.type === "tool_execution_end") {
+        rmSync(path.join(ctx.cwd, "d"), { recursive: true, force: true });
+        try {
+          symlinkSync(outside, path.join(ctx.cwd, "d"), "dir");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+        }
+      }
+    });
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "normal.txt", content: "agent\n" })]),
+      fauxAssistantMessage("done"),
+    ]);
+    try {
+      await session.prompt("swap d");
+    } finally {
+      unsubscribe();
+    }
+    if (!(await lstat(path.join(ctx.cwd, "d")).catch(() => undefined))?.isSymbolicLink()) {
+      console.log("  skipped: directory symlinks are not permitted");
+      return;
+    }
+
+    await session.prompt("/undo");
+    assert.equal(await exists(path.join(ctx.cwd, "normal.txt")), false);
+    assert.equal((await lstat(path.join(ctx.cwd, "d"))).isSymbolicLink(), false, "undo replaces the link with the original directory");
+    assert.equal(await readText(path.join(ctx.cwd, "d", "a.txt")), "inside\n");
+    assert.equal(await readText(path.join(outside, "a.txt")), "outside\n", "undo never writes through the link");
+    assert.deepEqual(await readdir(outside), ["a.txt"]);
+  } finally {
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
+async function testUndoKeepsExecutableBit(): Promise<void> {
+  if (process.platform === "win32") {
+    console.log("  skipped: Windows has no executable bit");
+    return;
+  }
+  const ctx = await createContext();
+  const session = await createSession(ctx);
+  try {
+    const script = path.join(ctx.cwd, "run.sh");
+    const untouched = path.join(ctx.cwd, "untouched.sh");
+    await writeFile(script, "#!/bin/sh\necho v1\n");
+    await writeFile(untouched, "#!/bin/sh\n");
+    await chmod(script, 0o755);
+    await chmod(untouched, 0o750);
+    configureTestUI(session, ["Conversation and workspace"]);
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "run.sh", content: "#!/bin/sh\necho v2\n" })]),
+      fauxAssistantMessage("edited run.sh"),
+    ]);
+    await session.prompt("edit run.sh");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "after snapshot was not created");
+
+    await session.prompt("/undo");
+    assert.equal(await readText(script), "#!/bin/sh\necho v1\n");
+    assert.equal((await lstat(script)).mode & 0o777, 0o755, "undo must not drop the executable bit of a restored script");
+    assert.equal((await lstat(untouched)).mode & 0o777, 0o750, "files the restore does not rewrite keep their mode");
+  } finally {
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
 async function testLaterPromptIsSentBeforeSnapshotFinishes(): Promise<void> {
   const events: string[] = [];
   let delayStatus = false;
@@ -3874,7 +4338,8 @@ async function testLaterPromptSnapshotFailureIsReported(): Promise<void> {
     workspaceHistoryExtension(pi);
   });
   const errors: string[] = [];
-  const session = await createSession(ctx, undefined, undefined, error => errors.push(error));
+  const ui = newTestUIState();
+  const session = await createSession(ctx, undefined, createTestUIContext(ui, [], true), error => errors.push(error));
   try {
     const filePath = path.join(ctx.cwd, "file.txt");
     for (const value of ["A", "B", "C"]) {
@@ -3885,9 +4350,19 @@ async function testLaterPromptSnapshotFailureIsReported(): Promise<void> {
       ]);
       await session.prompt(`write ${value}`);
       assert.equal(await readText(filePath), `${value}\n`, "a failed snapshot must not block the agent's tools");
+      if (value === "A") {
+        assert.equal(
+          await pathExists(path.join(getShadowGitDir(session, ctx.cwd), "hooks")),
+          false,
+          "the shadow repository is created without Git's sample hooks",
+        );
+      }
       if (value === "B") {
         assert.equal(errors.length, 1, "the failure is reported once per prompt");
         assert.match(errors[0], /^turn_end: .*simulated status failure/);
+        assert.match(ui.statuses.get("workspace-history") ?? "", /snapshot failed/, "the footer shows the failure");
+      } else {
+        assert.equal(ui.statuses.get("workspace-history"), "⟲ history", "a captured operation clears the failure");
       }
     }
     assert.equal(errors.length, 1);
@@ -3986,6 +4461,48 @@ async function testRestoreTimeoutWaitsBeforeRollback(): Promise<void> {
       session.dispose();
       await disposeContext(ctx);
     }
+  }
+}
+
+async function testUndoBeyondScanLimitKeepsExcludedFiles(): Promise<void> {
+  const ctx = await createContext();
+  await writeWorkspaceHistorySettings(ctx, {
+    storageDir: getWorkspaceHistoryStateDir(ctx.rootDir), maxScanFiles: 5, maxScanDirs: 3,
+  });
+  await writeFile(path.join(ctx.cwd, ".gitignore"), "build/\n!.env.local\n");
+  await mkdir(path.join(ctx.cwd, "build", "out"), { recursive: true });
+  await writeFile(path.join(ctx.cwd, "build", "out", "artifact.js"), "artifact\n");
+  await writeFile(path.join(ctx.cwd, ".env.local"), "SECRET=1\n");
+  await mkdir(path.join(ctx.cwd, "pkg", "sub"), { recursive: true });
+  await writeFile(path.join(ctx.cwd, "pkg", "sub", ".gitignore"), "cache/\n");
+  await mkdir(path.join(ctx.cwd, "pkg", "sub", "cache"), { recursive: true });
+  await writeFile(path.join(ctx.cwd, "pkg", "sub", "cache", "c.bin"), "cache\n");
+  await Promise.all(Array.from({ length: 30 }, async (_, index) => {
+    await writeFile(path.join(ctx.cwd, "pkg", `file-${index}.txt`), `${index}\n`);
+  }));
+  const session = await createSession(ctx);
+  try {
+    configureTestUI(session, ["Conversation and workspace"]);
+    ctx.provider.setResponses([
+      fauxAssistantMessage([
+        fauxToolCall("write", { path: "pkg/new.txt", content: "new\n" }),
+        fauxToolCall("write", { path: "pkg/file-3.txt", content: "changed\n" }),
+      ]),
+      fauxAssistantMessage("done"),
+    ]);
+    await session.prompt("change files");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "after snapshot was not created");
+
+    await session.prompt("/undo");
+    assert.equal(await exists(path.join(ctx.cwd, "pkg", "new.txt")), false, "undo beyond the scan limit still removes created files");
+    assert.equal(await readText(path.join(ctx.cwd, "pkg", "file-3.txt")), "3\n");
+    assert.equal(await readText(path.join(ctx.cwd, "build", "out", "artifact.js")), "artifact\n", "ignored directories survive the restore");
+    assert.equal(await readText(path.join(ctx.cwd, ".env.local")), "SECRET=1\n", "hard-excluded files survive even when .gitignore negates them");
+    assert.equal(await readText(path.join(ctx.cwd, "pkg", "sub", "cache", "c.bin")), "cache\n", "nested .gitignore rules are honored");
+    assert.equal(await readText(path.join(ctx.cwd, "pkg", "file-29.txt")), "29\n");
+  } finally {
+    session.dispose();
+    await disposeContext(ctx);
   }
 }
 
@@ -4409,7 +4926,7 @@ async function testPersistentWindowsFileLockReportsCauseAndCanBeRetried(): Promi
     releaseLock = undefined;
     await session.prompt("/undo");
 
-    assert.equal(session.sessionManager.getLeafId(), baseline!.id, "undo should be retryable after the persistent lock is released");
+    assertUndoneToBeforeFirstPrompt(session, baseline!.id, "undo should be retryable after the persistent lock is released");
     await waitForExists(filePath, false, "retry should restore the target snapshot without skipping the formerly locked file");
     await waitForText(companionPath, "before\n", "retry should restore every file in the target snapshot");
     assert.equal(await pathExists(getPendingRecoveryFile(session, ctx.cwd)), false, "successful recovery should clear the persisted recovery state");
@@ -4475,7 +4992,7 @@ async function testPendingRecoveryPreservesLaterManualEdits(): Promise<void> {
     assert.equal(await pathExists(getPendingRecoveryFile(session, ctx.cwd)), false, "checkpoint should clear obsolete recovery state");
 
     await session.prompt("/undo");
-    assert.equal(session.sessionManager.getLeafId(), baseline!.id, "undo should work after preserving later edits with a checkpoint");
+    assertUndoneToBeforeFirstPrompt(session, baseline!.id, "undo should work after preserving later edits with a checkpoint");
     await waitForExists(lockedPath, false, "undo should restore the target snapshot after checkpointing later edits");
     await waitForText(companionPath, "before\n", "undo should restore the companion file after checkpointing later edits");
     session.dispose();
@@ -4658,7 +5175,17 @@ async function main(): Promise<void> {
     { name: "snapshot ignores global signing", run: testSnapshotIgnoresGlobalSigning },
     { name: "restore timeout waits before rollback", run: testRestoreTimeoutWaitsBeforeRollback },
     { name: "snapshot discovery honors nested ignores without scan limits", run: testSnapshotDiscoveryHonorsGitIgnoresWithoutScanLimit },
+    { name: "undo beyond scan limit keeps excluded files", run: testUndoBeyondScanLimitKeepsExcludedFiles },
     { name: "snapshot stages only changed paths", run: testSnapshotStagesOnlyChangedPaths },
+    { name: "large untracked files are skipped", run: testLargeUntrackedFilesAreSkipped },
+    { name: "large file limit can be disabled", run: testLargeFileLimitCanBeDisabled },
+    { name: "diff shows agent operation changes", run: testDiffShowsAgentOperationChanges },
+    { name: "full snapshot writes one pack", run: testFullSnapshotWritesOnePack },
+    { name: "status indicator follows settings", run: testStatusIndicatorFollowsSettings },
+    { name: "untrusted project settings are ignored", run: testUntrustedProjectSettingsAreIgnored },
+    { name: "home folder is skipped quietly and reports home instead of storageDir", run: testHomeFolderReportsHomeInsteadOfStorageDir },
+    { name: "undo does not write through symlinks", run: testUndoDoesNotWriteThroughSymlinks },
+    { name: "undo keeps the executable bit", run: testUndoKeepsExecutableBit },
     { name: "later prompt is sent before snapshot finishes", run: testLaterPromptIsSentBeforeSnapshotFinishes },
     { name: "later prompt snapshot failure is reported", run: testLaterPromptSnapshotFailureIsReported },
     { name: "real git add timeout", run: testRealGitAddTimeout },
@@ -4689,10 +5216,12 @@ async function main(): Promise<void> {
     { name: "root repository keeps multi-repo workspace enabled", run: testRootRepositoryKeepsMultiRepoWorkspaceEnabled },
     { name: "forced enable allows multi-repo containers", run: testForcedEnableAllowsMultiRepoContainers },
     { name: "multi-repo container scan is cached", run: testMultiRepoContainerScanIsCached },
+    { name: "shutdown cancels baseline warmup", run: testShutdownCancelsBaselineWarmup },
     { name: "multi-repo container scan is bounded", run: testMultiRepoContainerScanIsBounded },
     { name: "multi-repo container cache invalidates after directory change", run: testMultiRepoContainerCacheInvalidatesAfterDirectoryChange },
     { name: "ancestor project markers enable subdirectories", run: testAncestorProjectMarkersEnableSubdirectories },
     { name: "conversation-only undo keeps workspace", run: testUndoConversationOnlyKeepsWorkspace },
+    { name: "undo after all operations are undone is a no-op", run: testUndoAfterAllOperationsUndoneIsNoop },
     { name: "redo reuses conversation-only undo mode", run: testRedoReusesConversationOnlyMode },
     { name: "cancelling navigation choice keeps conversation and workspace", run: testNavigationChoiceCancellationKeepsConversationAndWorkspace },
     { name: "conversation-only undo preserves manual changes as branch state", run: testConversationOnlyUndoPreservesManualChangesAsBranchState },
