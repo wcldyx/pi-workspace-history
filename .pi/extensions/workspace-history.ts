@@ -3841,10 +3841,12 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     if (!await ensureWorkspaceHistoryAvailable(ctx, state, "before_agent_start")) {
       return;
     }
+    // Pi 1.4 also starts runs from an extension's custom message, which has no prompt.
+    const prompt = "prompt" in event ? event.prompt : undefined;
     if (!state.pendingTurnId && !state.pendingBeforeCommit) {
-      state.pendingPromptText = event.prompt;
+      state.pendingPromptText = prompt;
     }
-    startBeforeSnapshotForTurn(ctx, state, event.prompt);
+    startBeforeSnapshotForTurn(ctx, state, prompt);
     if (!hasBaselineSnapshotEntry(ctx)) {
       // The baseline entry must precede the prompt in the session, so the
       // first snapshot still holds the prompt back.
