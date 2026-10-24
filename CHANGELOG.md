@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `/diff` shows line numbers and highlights the changed words within a line, using the same diff renderer as Pi's edit tool (#15). If the host Pi does not provide that renderer, `/diff` colors whole lines as before.
+
 ## 0.5.0 - 2026-10-08
 
 ### Added

@@ -11,6 +11,7 @@ import {
   createAgentSession,
   DefaultResourceLoader,
   getAgentDir,
+  initTheme,
   ModelRuntime,
   SessionManager,
   SettingsManager,
@@ -4079,6 +4080,49 @@ async function testDiffShowsAgentOperationChanges(): Promise<void> {
   }
 }
 
+async function testDiffUsesPiDiffRenderer(): Promise<void> {
+  const themeKeys = [Symbol.for("@earendil-works/pi-coding-agent:theme"), Symbol.for("@mariozechner/pi-coding-agent:theme")];
+  const ctx = await createContext();
+  const session = await createSession(ctx);
+  try {
+    initTheme("dark");
+    const ui = configureTestUI(session, [], true, "tui");
+    ctx.provider.setResponses([
+      fauxAssistantMessage([
+        fauxToolCall("write", { path: "a.txt", content: "one\n-- old\ntwo\n" }),
+        fauxToolCall("write", { path: "b.txt", content: "x\nalpha beta\n" }),
+      ]),
+      fauxAssistantMessage("A"),
+    ]);
+    await session.prompt("write files");
+    ctx.provider.setResponses([
+      fauxAssistantMessage([
+        fauxToolCall("write", { path: "a.txt", content: "one\nthree\n" }),
+        fauxToolCall("write", { path: "b.txt", content: "x\nalpha gamma\n" }),
+      ]),
+      fauxAssistantMessage("B"),
+    ]);
+    await session.prompt("change files");
+
+    await session.prompt("/diff");
+    const rendered = ui.customRenders.at(-1)?.join("\n") ?? "";
+    const plain = rendered.replace(/\x1b\[[0-9;]*m/g, "");
+    assert.match(plain, /^ {2}1 one$/m, "context lines are numbered");
+    assert.match(plain, /^ -2 -- old$/m, "a removed line starting with -- stays in the hunk");
+    assert.match(plain, /^ -3 two$/m);
+    assert.match(plain, /^ \+2 three$/m);
+    assert.match(plain, /^ \+2 alpha gamma$/m);
+    assert.match(plain, /^ -2 alpha beta$/m);
+    assert.doesNotMatch(plain, /^ @@/m);
+    assert.match(plain, /^ diff --git a\/a\.txt b\/a\.txt$/m);
+    assert.doesNotMatch(plain, /^ (?:index |--- a\/|\+\+\+ b\/)/m, "git file headers are hidden");
+  } finally {
+    for (const key of themeKeys) delete (globalThis as Record<symbol, unknown>)[key];
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
 async function testStatusIndicatorFollowsSettings(): Promise<void> {
   const ctx = await createContext();
   const ui = newTestUIState();
@@ -5180,6 +5224,7 @@ async function main(): Promise<void> {
     { name: "large untracked files are skipped", run: testLargeUntrackedFilesAreSkipped },
     { name: "large file limit can be disabled", run: testLargeFileLimitCanBeDisabled },
     { name: "diff shows agent operation changes", run: testDiffShowsAgentOperationChanges },
+    { name: "diff uses pi's diff renderer", run: testDiffUsesPiDiffRenderer },
     { name: "full snapshot writes one pack", run: testFullSnapshotWritesOnePack },
     { name: "status indicator follows settings", run: testStatusIndicatorFollowsSettings },
     { name: "untrusted project settings are ignored", run: testUntrustedProjectSettingsAreIgnored },
