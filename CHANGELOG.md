@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `/diff` wraps long lines instead of cutting them off at the terminal width, so a change near the end of a long line is visible (#15). Wrapped rows line up after the line number.
+
 ## 0.5.1 - 2026-10-24
 
 - `/diff` shows line numbers and highlights the changed words within a line, using the same diff renderer as Pi's edit tool (#15). If the host Pi does not provide that renderer, `/diff` colors whole lines as before.

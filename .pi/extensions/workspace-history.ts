@@ -7,7 +7,7 @@ import type {
   SessionMessageEntry,
 } from "@earendil-works/pi-coding-agent";
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, stripTerminalSequences, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import {
   access,
   appendFile,
@@ -3363,19 +3363,35 @@ async function showOperationChanges(ctx: ExtensionCommandContext, title: string,
       ...patchLines,
       ...(changes.truncated ? [theme.fg("warning", `… diff truncated after ${DIFF_MAX_PATCH_LINES} lines`)] : []),
     ];
+    // Long lines wrap instead of being cut off, because the changed part of a
+    // line may be past the terminal width. Continuation rows line up with the
+    // text after the line number.
+    const wrapBodyLine = (line: string, width: number): string[] => {
+      const numbered = /^[-+ ]\s*\d+ /.exec(stripTerminalSequences(line));
+      const indent = Math.min(numbered ? numbered[0].length : 2, Math.floor(width / 2));
+      const [first = "", ...rest] = wrapTextWithAnsi(line, Math.max(1, width - indent));
+      return [first, ...rest.map(row => " ".repeat(indent) + row)];
+    };
+    let rows: string[] = body;
+    let rowsWidth = -1;
     let offset = 0;
     const pageSize = () => Math.max(5, tui.terminal.rows - 8);
     const scrollTo = (next: number) => {
-      offset = Math.max(0, Math.min(next, Math.max(0, body.length - pageSize())));
+      offset = Math.max(0, Math.min(next, Math.max(0, rows.length - pageSize())));
       tui.requestRender();
     };
     return {
       render(width: number): string[] {
+        if (rowsWidth !== width) {
+          rows = body.flatMap(line => wrapBodyLine(line, Math.max(1, width - 1)));
+          rowsWidth = width;
+          offset = Math.max(0, Math.min(offset, rows.length - pageSize()));
+        }
         const lines = [
           theme.fg("accent", "─".repeat(width)),
           truncateToWidth(` ${theme.bold(header[0] ?? "")}  ${theme.fg("muted", header[1] ?? "")}`, width),
-          ...body.slice(offset, offset + pageSize()).map(line => truncateToWidth(` ${line}`, width)),
-          theme.fg("dim", truncateToWidth(` ↑↓ scroll • Space/b page • Esc close  (${Math.min(body.length, offset + pageSize())}/${body.length})`, width)),
+          ...rows.slice(offset, offset + pageSize()).map(line => truncateToWidth(` ${line}`, width)),
+          theme.fg("dim", truncateToWidth(` ↑↓ scroll • Space/b page • Esc close  (${Math.min(rows.length, offset + pageSize())}/${rows.length})`, width)),
           theme.fg("accent", "─".repeat(width)),
         ];
         return lines;
@@ -3387,7 +3403,7 @@ async function showOperationChanges(ctx: ExtensionCommandContext, title: string,
         else if (matchesKey(data, Key.pageUp) || data === "b") scrollTo(offset - pageSize());
         else if (matchesKey(data, Key.pageDown) || data === " ") scrollTo(offset + pageSize());
         else if (matchesKey(data, Key.home) || data === "g") scrollTo(0);
-        else if (matchesKey(data, Key.end) || data === "G") scrollTo(body.length);
+        else if (matchesKey(data, Key.end) || data === "G") scrollTo(rows.length);
       },
       invalidate(): void {},
     };

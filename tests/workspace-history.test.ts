@@ -667,6 +667,7 @@ interface TestUIState {
   selections: Array<{ title: string; options: string[] }>;
   statuses: Map<string, string | undefined>;
   customRenders: string[][];
+  customRenderWidth?: number;
 }
 
 function configureTestUI(
@@ -727,7 +728,7 @@ function createTestUIContext(
         const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
         void Promise.resolve(factory(tui, theme, {}, resolve)).then((component) => {
           const typed = component as { render(width: number): string[]; handleInput?(data: string): void };
-          state.customRenders.push(typed.render(160));
+          state.customRenders.push(typed.render(state.customRenderWidth ?? 160));
           typed.handleInput?.("q");
         });
       });
@@ -4091,6 +4092,7 @@ async function testDiffUsesPiDiffRenderer(): Promise<void> {
       fauxAssistantMessage([
         fauxToolCall("write", { path: "a.txt", content: "one\n-- old\ntwo\n" }),
         fauxToolCall("write", { path: "b.txt", content: "x\nalpha beta\n" }),
+        fauxToolCall("write", { path: "c.txt", content: `${"word ".repeat(12)}height="236pt"\n` }),
       ]),
       fauxAssistantMessage("A"),
     ]);
@@ -4099,6 +4101,7 @@ async function testDiffUsesPiDiffRenderer(): Promise<void> {
       fauxAssistantMessage([
         fauxToolCall("write", { path: "a.txt", content: "one\nthree\n" }),
         fauxToolCall("write", { path: "b.txt", content: "x\nalpha gamma\n" }),
+        fauxToolCall("write", { path: "c.txt", content: `${"word ".repeat(12)}height="302pt"\n` }),
       ]),
       fauxAssistantMessage("B"),
     ]);
@@ -4116,6 +4119,16 @@ async function testDiffUsesPiDiffRenderer(): Promise<void> {
     assert.doesNotMatch(plain, /^ @@/m);
     assert.match(plain, /^ diff --git a\/a\.txt b\/a\.txt$/m);
     assert.doesNotMatch(plain, /^ (?:index |--- a\/|\+\+\+ b\/)/m, "git file headers are hidden");
+
+    // Long lines wrap so the changed end of the line stays visible.
+    ui.customRenderWidth = 40;
+    await session.prompt("/diff");
+    const narrow = (ui.customRenders.at(-1) ?? []).map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+    assert.ok(narrow.every(line => line.length <= 40), "rows fit the width");
+    const narrowText = narrow.join("\n");
+    assert.match(narrowText, /^ -1 word word/m);
+    assert.match(narrowText, /^ -1 word word word word word word\n {4}word word word word word word\n {4}height="236pt"$/m, "continuation rows line up after the line number");
+    assert.match(narrowText, /^ {4}height="302pt"$/m);
   } finally {
     for (const key of themeKeys) delete (globalThis as Record<symbol, unknown>)[key];
     session.dispose();
