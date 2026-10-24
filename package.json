@@ -1,6 +1,6 @@
 {
   "name": "pi-workspace-history",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "type": "module",
   "description": "Undo, roll back, and revert code changes made by the Pi coding agent: files and conversation together. One-step /undo and /redo, /tree workspace restore, /diff, and manual checkpoints, with history kept outside your repository.",
   "author": "wcldyx",

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.2 - 2026-10-24
 
 - `/diff` wraps long lines instead of cutting them off at the terminal width, so a change near the end of a long line is visible (#15). Wrapped rows line up after the line number.
 
