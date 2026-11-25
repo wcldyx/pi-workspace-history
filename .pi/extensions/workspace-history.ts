@@ -7,7 +7,6 @@ import type {
   SessionMessageEntry,
 } from "@earendil-works/pi-coding-agent";
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, stripTerminalSequences, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import {
   access,
   appendFile,
@@ -3329,6 +3328,173 @@ function splitPatchForPiDiff(patch: string[]): OperationPatchSection[] {
   return sections;
 }
 
+// Terminal text helpers. Hosts expose different pi-tui packages (omp provides none of the
+// upstream one), so the diff viewer measures, cuts and wraps rows itself.
+const TERMINAL_RESET = "\x1b[0m";
+const TERMINAL_SEQUENCE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|[\]_P^X][^\x07\x1b]*(?:\x07|\x1b\\))/y;
+const TERMINAL_SEQUENCE_ALL = new RegExp(TERMINAL_SEQUENCE.source, "g");
+const WIDE_CELL = /[\u1100-\u115f\u2e80-\u303e\u3041-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6\u{1f300}-\u{1f64f}\u{1f900}-\u{1f9ff}\u{20000}-\u{3fffd}]|\p{Emoji_Presentation}/u;
+const ZERO_WIDTH_CELL = /^[\p{Default_Ignorable_Code_Point}\p{Control}\p{Mark}]+$/u;
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+interface TerminalToken {
+  text: string;
+  width: number;
+  sequence: boolean;
+}
+
+function tokenizeTerminalText(text: string): TerminalToken[] {
+  const tokens: TerminalToken[] = [];
+  let plain = "";
+  const flush = () => {
+    for (const { segment } of graphemeSegmenter.segment(plain)) {
+      const width = segment === "\t" ? 3 : ZERO_WIDTH_CELL.test(segment) ? 0 : WIDE_CELL.test(segment) ? 2 : 1;
+      tokens.push({ text: segment, width, sequence: false });
+    }
+    plain = "";
+  };
+  let index = 0;
+  while (index < text.length) {
+    if (text.charCodeAt(index) === 0x1b) {
+      TERMINAL_SEQUENCE.lastIndex = index;
+      const match = TERMINAL_SEQUENCE.exec(text);
+      if (match) {
+        flush();
+        tokens.push({ text: match[0], width: 0, sequence: true });
+        index += match[0].length;
+        continue;
+      }
+    }
+    const char = String.fromCodePoint(text.codePointAt(index) as number);
+    plain += char;
+    index += char.length;
+  }
+  flush();
+  return tokens;
+}
+
+function truncateToWidth(text: string, maxWidth: number, ellipsis = "..."): string {
+  if (maxWidth <= 0) return "";
+  const tokens = tokenizeTerminalText(text);
+  if (tokens.reduce((total, token) => total + token.width, 0) <= maxWidth) return text;
+  if (ellipsis.length >= maxWidth) return ellipsis.slice(0, maxWidth);
+  const limit = maxWidth - ellipsis.length;
+  let kept = "";
+  let width = 0;
+  for (const token of tokens) {
+    if (!token.sequence && width + token.width > limit) break;
+    kept += token.text;
+    width += token.width;
+  }
+  return `${kept}${TERMINAL_RESET}${ellipsis}${TERMINAL_RESET}`;
+}
+
+// Breaks at spaces and splits words longer than a row. Styles that are open at a break are
+// closed there and opened again on the next row.
+function wrapTextWithAnsi(text: string, width: number): string[] {
+  const tokens = tokenizeTerminalText(text);
+  if (tokens.reduce((total, token) => total + token.width, 0) <= width) return [text];
+  const rows: string[] = [];
+  let active: string[] = [];
+  let row = "";
+  let rowWidth = 0;
+  let rowEnd: string[] = [];
+  let pending = "";
+  let pendingWidth = 0;
+  const track = (sequence: string, styles: string[]): string[] => {
+    const sgr = /^\x1b\[([0-9;:]*)m$/.exec(sequence);
+    if (!sgr) return styles;
+    return sgr[1] === "" || sgr[1] === "0" ? [] : [...styles, sequence];
+  };
+  const closeRow = (styles: string[]) => {
+    rows.push(styles.length > 0 ? row + TERMINAL_RESET : row);
+  };
+  const runs: { text: string; width: number; space: boolean; wide: boolean; tokens: TerminalToken[] }[] = [];
+  for (const token of tokens) {
+    const space = !token.sequence && token.text.trim() === "";
+    const last = runs[runs.length - 1];
+    // Every wide character may end a row, because such text has no spaces between words.
+    const wide = !token.sequence && token.width === 2;
+    if (last && !wide && !last.wide && (token.sequence || last.space === space)) {
+      last.text += token.text;
+      last.width += token.width;
+      last.tokens.push(token);
+    } else {
+      runs.push({ text: token.text, width: token.width, space, wide, tokens: [token] });
+    }
+  }
+  for (const run of runs) {
+    const before = active;
+    for (const token of run.tokens) if (token.sequence) active = track(token.text, active);
+    if (run.space) {
+      pending += run.text;
+      pendingWidth += run.width;
+      continue;
+    }
+    if (rowWidth + pendingWidth + run.width <= width) {
+      row += pending + run.text;
+      rowWidth += pendingWidth + run.width;
+      rowEnd = active;
+      pending = "";
+      pendingWidth = 0;
+      continue;
+    }
+    if (rowWidth > 0) closeRow(rowEnd);
+    row = before.join("");
+    rowWidth = 0;
+    pending = "";
+    pendingWidth = 0;
+    let styles = before;
+    for (const token of run.tokens) {
+      if (token.sequence) {
+        styles = track(token.text, styles);
+        row += token.text;
+      } else {
+        if (rowWidth + token.width > width && rowWidth > 0) {
+          closeRow(styles);
+          row = styles.join("");
+          rowWidth = 0;
+        }
+        row += token.text;
+        rowWidth += token.width;
+      }
+    }
+    rowEnd = active;
+  }
+  if (row !== "" || rows.length === 0) rows.push(row);
+  return rows;
+}
+
+// Raw terminal input for the keys the diff viewer uses: legacy sequences and the kitty
+// protocol's CSI-u and modified forms. Modified keys and key releases do not match.
+function terminalKeyName(data: string): "escape" | "enter" | "up" | "down" | "pageUp" | "pageDown" | "home" | "end" | undefined {
+  if (data === "\x1b") return "escape";
+  if (data === "\r" || data === "\n") return "enter";
+  const legacy = /^\x1b[[O]([ABHF])$/.exec(data);
+  const csi = legacy ? undefined : /^\x1b\[(\d+)(?::\d+)*(?:;(\d+)(?::(\d+))?)?([A-Za-z~])$/.exec(data);
+  let code = "";
+  let final = "";
+  if (legacy) {
+    final = legacy[1] as string;
+  } else if (csi) {
+    const modifiers = Number(csi[2] ?? 1) - 1;
+    if ((modifiers & ~(64 | 128)) !== 0 || csi[3] === "3") return undefined;
+    code = csi[1] as string;
+    final = csi[4] as string;
+  } else {
+    return undefined;
+  }
+  switch (final) {
+    case "A": return "up";
+    case "B": return "down";
+    case "H": return "home";
+    case "F": return "end";
+    case "~": return ({ "1": "home", "7": "home", "4": "end", "8": "end", "5": "pageUp", "6": "pageDown" } as const)[code as "1"];
+    case "u": return code === "27" ? "escape" : code === "13" || code === "57414" ? "enter" : undefined;
+    default: return undefined;
+  }
+}
+
 async function showOperationChanges(ctx: ExtensionCommandContext, title: string, changes: OperationChanges): Promise<void> {
   const header = [title, formatOperationChangeSummary(changes), ...changes.files.map(formatOperationFileLine)];
   if (ctx.mode !== "tui") {
@@ -3367,7 +3533,7 @@ async function showOperationChanges(ctx: ExtensionCommandContext, title: string,
     // line may be past the terminal width. Continuation rows line up with the
     // text after the line number.
     const wrapBodyLine = (line: string, width: number): string[] => {
-      const numbered = /^[-+ ]\s*\d+ /.exec(stripTerminalSequences(line));
+      const numbered = /^[-+ ]\s*\d+ /.exec(line.replace(TERMINAL_SEQUENCE_ALL, ""));
       const indent = Math.min(numbered ? numbered[0].length : 2, Math.floor(width / 2));
       const [first = "", ...rest] = wrapTextWithAnsi(line, Math.max(1, width - indent));
       return [first, ...rest.map(row => " ".repeat(indent) + row)];
@@ -3375,7 +3541,12 @@ async function showOperationChanges(ctx: ExtensionCommandContext, title: string,
     let rows: string[] = body;
     let rowsWidth = -1;
     let offset = 0;
-    const pageSize = () => Math.max(5, tui.terminal.rows - 8);
+    // omp's host has no tui.terminal; it reports the size through ui.size().
+    const terminalRows = (): number => {
+      const sized = tui as unknown as { size?: () => { rows: number } };
+      return typeof sized.size === "function" ? sized.size().rows : tui.terminal.rows;
+    };
+    const pageSize = () => Math.max(5, terminalRows() - 8);
     const scrollTo = (next: number) => {
       offset = Math.max(0, Math.min(next, Math.max(0, rows.length - pageSize())));
       tui.requestRender();
@@ -3397,13 +3568,14 @@ async function showOperationChanges(ctx: ExtensionCommandContext, title: string,
         return lines;
       },
       handleInput(data: string): void {
-        if (matchesKey(data, Key.escape) || matchesKey(data, Key.enter) || data === "q") done();
-        else if (matchesKey(data, Key.up) || data === "k") scrollTo(offset - 1);
-        else if (matchesKey(data, Key.down) || data === "j") scrollTo(offset + 1);
-        else if (matchesKey(data, Key.pageUp) || data === "b") scrollTo(offset - pageSize());
-        else if (matchesKey(data, Key.pageDown) || data === " ") scrollTo(offset + pageSize());
-        else if (matchesKey(data, Key.home) || data === "g") scrollTo(0);
-        else if (matchesKey(data, Key.end) || data === "G") scrollTo(rows.length);
+        const key = terminalKeyName(data);
+        if (key === "escape" || key === "enter" || data === "q") done();
+        else if (key === "up" || data === "k") scrollTo(offset - 1);
+        else if (key === "down" || data === "j") scrollTo(offset + 1);
+        else if (key === "pageUp" || data === "b") scrollTo(offset - pageSize());
+        else if (key === "pageDown" || data === " ") scrollTo(offset + pageSize());
+        else if (key === "home" || data === "g") scrollTo(0);
+        else if (key === "end" || data === "G") scrollTo(rows.length);
       },
       invalidate(): void {},
     };
