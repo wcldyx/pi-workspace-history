@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.5.3 - 2026-11-26
 
-- The extension no longer imports `@earendil-works/pi-tui`, so it loads in omp 19.2 and later, which dropped that package. `/diff` measures, wraps and reads keys itself and works the same in Pi.
+- The extension no longer imports `@earendil-works/pi-tui`, so it loads in omp 19.2 and later, which dropped that package. `/diff` measures, wraps and reads keys itself and works the same in Pi (#16).
 
 ## 0.5.2 - 2026-10-24
 
