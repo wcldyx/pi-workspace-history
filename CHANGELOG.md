@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The extension no longer imports `@earendil-works/pi-tui`, so it loads in omp 19.2 and later, which dropped that package. `/diff` measures, wraps and reads keys itself and works the same in Pi.
+
 ## 0.5.2 - 2026-10-24
 
 - `/diff` wraps long lines instead of cutting them off at the terminal width, so a change near the end of a long line is visible (#15). Wrapped rows line up after the line number.

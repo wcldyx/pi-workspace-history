@@ -668,6 +668,9 @@ interface TestUIState {
   statuses: Map<string, string | undefined>;
   customRenders: string[][];
   customRenderWidth?: number;
+  customInput?: string;
+  customHostSize?: boolean;
+  customClosed: boolean[];
 }
 
 function configureTestUI(
@@ -681,6 +684,7 @@ function configureTestUI(
     selections: [],
     statuses: new Map(),
     customRenders: [],
+    customClosed: [],
   };
   session.extensionRunner.setUIContext(createTestUIContext(state, choices, selectFirstByDefault), mode);
   return state;
@@ -707,6 +711,7 @@ function createTestUIContext(
 ): TestUIContext {
   state.statuses ??= new Map();
   state.customRenders ??= [];
+  state.customClosed ??= [];
   const uiContext = new Proxy({
     async select(title: string, options: string[]): Promise<string | undefined> {
       state.selections.push({ title, options: [...options] });
@@ -724,12 +729,22 @@ function createTestUIContext(
     // Renders the component once, records its lines, then closes it with "q".
     async custom(factory: (...args: unknown[]) => unknown): Promise<unknown> {
       return new Promise((resolve) => {
-        const tui = { terminal: { rows: 40 }, requestRender(): void {} };
+        // omp's UI host reports its size through size() and has no terminal property.
+        const tui = state.customHostSize
+          ? { size: () => ({ columns: 160, rows: 40 }), requestRender(): void {} }
+          : { terminal: { rows: 40 }, requestRender(): void {} };
         const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
-        void Promise.resolve(factory(tui, theme, {}, resolve)).then((component) => {
+        let closed = false;
+        const done = (value: unknown): void => {
+          closed = true;
+          resolve(value);
+        };
+        void Promise.resolve(factory(tui, theme, {}, done)).then((component) => {
           const typed = component as { render(width: number): string[]; handleInput?(data: string): void };
           state.customRenders.push(typed.render(state.customRenderWidth ?? 160));
-          typed.handleInput?.("q");
+          typed.handleInput?.(state.customInput ?? "q");
+          state.customClosed.push(closed);
+          resolve(undefined);
         });
       });
     },
@@ -3923,7 +3938,7 @@ function assertUndoneToBeforeFirstPrompt(
 }
 
 function newTestUIState(): TestUIState {
-  return { notifications: [], selections: [], statuses: new Map(), customRenders: [] };
+  return { notifications: [], selections: [], statuses: new Map(), customRenders: [], customClosed: [] };
 }
 
 async function listShadowHeadFiles(session: Awaited<ReturnType<typeof createSession>>, cwd: string): Promise<string[]> {
@@ -4131,6 +4146,47 @@ async function testDiffUsesPiDiffRenderer(): Promise<void> {
     assert.match(narrowText, /^ {4}height="302pt"$/m);
   } finally {
     for (const key of themeKeys) delete (globalThis as Record<symbol, unknown>)[key];
+    session.dispose();
+    await disposeContext(ctx);
+  }
+}
+
+async function testDiffViewerWorksWithoutPiTui(): Promise<void> {
+  const ctx = await createContext();
+  const session = await createSession(ctx);
+  try {
+    const ui = configureTestUI(session, [], true, "tui");
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "wide.txt", content: `${"宽字符的一行".repeat(12)} end\n` })]),
+      fauxAssistantMessage("A"),
+    ]);
+    await session.prompt("write wide");
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "wide.txt", content: `${"宽字符的一行".repeat(12)} changed\n` })]),
+      fauxAssistantMessage("B"),
+    ]);
+    await session.prompt("change wide");
+
+    ui.customRenderWidth = 40;
+    ui.customHostSize = true;
+    await session.prompt("/diff");
+    const rows = (ui.customRenders.at(-1) ?? []).map(line => line.replace(/\x1b\[[0-9;]*m/g, ""));
+    const cells = (line: string) => [...line].reduce((total, char) => total + (/[\u2e80-\u9fff]/.test(char) ? 2 : 1), 0);
+    assert.ok(rows.length > 4, "the diff is drawn");
+    assert.ok(rows.every(line => cells(line) <= 40), "rows with wide characters fit the width");
+    assert.ok(rows.some(line => line.endsWith("changed")), "the changed end of the line stays visible");
+
+    for (const key of ["q", "\x1b", "\r", "\x1b[27u", "\x1b[13u"]) {
+      ui.customInput = key;
+      await session.prompt("/diff");
+      assert.equal(ui.customClosed.at(-1), true, `key ${JSON.stringify(key)} closes the diff viewer`);
+    }
+    for (const key of ["\x1b[1;5A", "\x1b[27;1:3u", "x"]) {
+      ui.customInput = key;
+      await session.prompt("/diff");
+      assert.equal(ui.customClosed.at(-1), false, `key ${JSON.stringify(key)} leaves the diff viewer open`);
+    }
+  } finally {
     session.dispose();
     await disposeContext(ctx);
   }
@@ -5238,6 +5294,7 @@ async function main(): Promise<void> {
     { name: "large file limit can be disabled", run: testLargeFileLimitCanBeDisabled },
     { name: "diff shows agent operation changes", run: testDiffShowsAgentOperationChanges },
     { name: "diff uses pi's diff renderer", run: testDiffUsesPiDiffRenderer },
+    { name: "diff viewer works without pi-tui", run: testDiffViewerWorksWithoutPiTui },
     { name: "full snapshot writes one pack", run: testFullSnapshotWritesOnePack },
     { name: "status indicator follows settings", run: testStatusIndicatorFollowsSettings },
     { name: "untrusted project settings are ignored", run: testUntrustedProjectSettingsAreIgnored },
